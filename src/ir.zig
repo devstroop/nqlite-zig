@@ -217,6 +217,29 @@ pub const Memory = struct {
 
 const std = @import("std");
 
+/// Structural RecordId equality (table bytes + Id variant/value).
+pub fn recordIdEql(a: RecordId, b: RecordId) bool {
+    if (!std.mem.eql(u8, a.table, b.table)) return false;
+    return switch (a.id) {
+        .num => |x| switch (b.id) {
+            .num => |y| x == y,
+            .str => false,
+        },
+        .str => |x| switch (b.id) {
+            .num => false,
+            .str => |y| std.mem.eql(u8, x, y),
+        },
+    };
+}
+
+/// Display form `table:id` (the `id` pseudo-field binds to this).
+pub fn recordIdDisplay(gpa: std.mem.Allocator, rid: RecordId) ![]const u8 {
+    return switch (rid.id) {
+        .num => |n| std.fmt.allocPrint(gpa, "{s}:{d}", .{ rid.table, n }),
+        .str => |s| std.fmt.allocPrint(gpa, "{s}:{s}", .{ rid.table, s }),
+    };
+}
+
 test "canonical RecordId order" {
     const a = RecordId{ .table = "a", .id = .{ .num = 5 } };
     const b = RecordId{ .table = "a", .id = .{ .str = "007" } };

@@ -1,0 +1,978 @@
+//! Deterministic in-memory engine (spec/nql.md §2) — port of
+//! `nqlite/src/engine.rs` (M3 scope: CREATE/INSERT/RELATE/FORGET/SELECT
+//! with every field predicate, exact kNN, BM25/hybrid, all score orders,
+//! COUNT/projection/paging; MATCH/CLOSURE/temporal land with M7).
+//!
+//! Determinism rules honored here: records iterate in canonical RecordId
+//! order (the BTreeMap contract), ties always break by ascending RecordId,
+//! all arithmetic is f32 (bit-parity with the Rust oracle), and there is
+//! no wall-clock or randomness anywhere.
+
+const std = @import("std");
+const ir = @import("ir.zig");
+const bm25mod = @import("bm25.zig");
+
+pub const EngineError = error{
+    OutOfMemory,
+    EmbeddingDimMismatch,
+    UnknownSortField,
+    MemoryWithoutContext,
+    NotImplemented,
+};
+
+/// Corpus-facing error names (mirror the Rust `Error` discriminants).
+pub fn errorVariant(e: EngineError) []const u8 {
+    if (e == error.EmbeddingDimMismatch) return "EmbeddingDimMismatch";
+    if (e == error.UnknownSortField) return "UnknownSortField";
+    if (e == error.MemoryWithoutContext) return "MemoryWithoutContext";
+    return "Internal";
+}
+
+pub const QueryKind = enum { select };
+
+pub const Row = struct {
+    record: ir.Record,
+    score: f32,
+};
+
+pub const QueryResult = struct {
+    kind: QueryKind,
+    rows: []const Row,
+};
+
+/// A scored candidate (kNN similarity / BM25 / hybrid input).
+const Scored = struct { id: ir.RecordId, s: f32 };
+/// One fused RRF contribution.
+const Fused = struct { id: ir.RecordId, fused: f32 };
+
+// ---------------------------------------------------------------------------
+// Store (mutable engine state; canonical record order by construction)
+// ---------------------------------------------------------------------------
+
+pub const EngineStore = struct {
+    gpa: std.mem.Allocator,
+    records: std.ArrayList(ir.Record) = .empty, // sorted by RecordId
+    edges: std.ArrayList(ir.RelationEdge) = .empty, // append order
+    tables: std.ArrayList(ir.TableEntry) = .empty, // name -> dim (upserted)
+    clock: i64 = 0,
+    history: std.ArrayList(ir.HistoryEntry) = .empty,
+    memories: std.ArrayList(Memory) = .empty,
+
+    /// A named memory partition (root-level, like the reference engine).
+    pub const Memory = struct {
+        name: []const u8,
+        store: EngineStore,
+    };
+
+    pub fn init(gpa: std.mem.Allocator) EngineStore {
+        return .{ .gpa = gpa };
+    }
+
+    fn findIndex(self: *EngineStore, id: ir.RecordId) ?usize {
+        var lo: usize = 0;
+        var hi: usize = self.records.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const c = cmpRecordId(self.records.items[mid].id, id);
+            if (c == .lt) lo = mid + 1 else hi = mid;
+        }
+        if (lo < self.records.items.len and ir.recordIdEql(self.records.items[lo].id, id))
+            return lo;
+        return null;
+    }
+
+    /// BTreeMap::insert semantics: replace in place, else sorted insert.
+    pub fn insert(self: *EngineStore, rec: ir.Record) !void {
+        if (self.findIndex(rec.id)) |i| {
+            self.records.items[i] = rec;
+            return;
+        }
+        var lo: usize = 0;
+        var hi: usize = self.records.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (ir.RecordId.less(self.records.items[mid].id, rec.id)) lo = mid + 1 else hi = mid;
+        }
+        try self.records.insert(self.gpa, lo, rec);
+    }
+
+    pub fn remove(self: *EngineStore, id: ir.RecordId) void {
+        if (self.findIndex(id)) |i| {
+            _ = self.records.orderedRemove(i);
+        }
+    }
+
+    pub fn logMutation(self: *EngineStore, stmt: ir.Statement) !void {
+        self.clock += 1;
+        try self.history.append(self.gpa, .{ .ts = self.clock, .stmt = stmt });
+    }
+
+    pub fn dimOf(self: *const EngineStore, table: []const u8) ?usize {
+        for (self.tables.items) |t| {
+            if (std.mem.eql(u8, t.name, table)) return t.vector_dim;
+        }
+        return null;
+    }
+
+    fn upsertTable(self: *EngineStore, name: []const u8, dim: ?usize) !void {
+        for (self.tables.items) |*t| {
+            if (std.mem.eql(u8, t.name, name)) {
+                t.vector_dim = dim;
+                return;
+            }
+        }
+        try self.tables.append(self.gpa, .{ .name = name, .vector_dim = dim });
+    }
+
+    fn memorySlot(self: *EngineStore, name: []const u8) !usize {
+        for (self.memories.items, 0..) |m, i| {
+            if (std.mem.eql(u8, m.name, name)) return i;
+        }
+        try self.memories.append(self.gpa, .{ .name = name, .store = EngineStore.init(self.gpa) });
+        return self.memories.items.len - 1;
+    }
+
+    fn memoryMut(self: *EngineStore, name: []const u8) !*EngineStore {
+        const i = try self.memorySlot(name);
+        return &self.memories.items[i].store;
+    }
+};
+
+fn cmpRecordId(a: ir.RecordId, b: ir.RecordId) std.math.Order {
+    if (ir.RecordId.less(a, b)) return .lt;
+    if (ir.RecordId.less(b, a)) return .gt;
+    return .eq;
+}
+
+// ---------------------------------------------------------------------------
+// Value total order (nql_ir::Value::cmp_total — issue #93 / spec §2.3)
+// ---------------------------------------------------------------------------
+
+fn valueRank(v: ir.Value) u8 {
+    return switch (v) {
+        .null => 0,
+        .bool => 1,
+        .int, .float => 2,
+        .str => 3,
+        .arr => 4,
+        .doc => 5,
+        .vector => 6,
+        .ref => 7,
+    };
+}
+
+/// IEEE total order for f64 (Rust f64::total_cmp semantics): NaN after every
+/// number, same-bit NaNs equal, numeric equality short-circuits (-0.0 == 0.0).
+fn totalOrdF64(a: f64, b: f64) std.math.Order {
+    if (a == b) return .eq; // catches -0.0 == 0.0
+    if (std.math.isNan(a) and std.math.isNan(b)) {
+        const ab: u64 = @bitCast(a);
+        const bb: u64 = @bitCast(b);
+        return if (ab < bb) .lt else if (ab > bb) .gt else .eq;
+    }
+    if (std.math.isNan(a)) return .gt;
+    if (std.math.isNan(b)) return .lt;
+    return if (a < b) .lt else .gt;
+}
+
+fn totalOrdF32(a: f32, b: f32) std.math.Order {
+    if (a == b) return .eq;
+    if (std.math.isNan(a) and std.math.isNan(b)) {
+        const ab: u32 = @bitCast(a);
+        const bb: u32 = @bitCast(b);
+        return if (ab < bb) .lt else if (ab > bb) .gt else .eq;
+    }
+    if (std.math.isNan(a)) return .gt;
+    if (std.math.isNan(b)) return .lt;
+    return if (a < b) .lt else .gt;
+}
+
+/// Exact i64-vs-f64 comparison (never rounds the int through f64).
+fn cmpIntFloat(a: i64, b: f64) std.math.Order {
+    if (std.math.isNan(b)) return .lt;
+    const max_i: f64 = @floatFromInt(std.math.maxInt(i64));
+    const min_i: f64 = @floatFromInt(std.math.minInt(i64));
+    if (b >= max_i) return .lt;
+    if (b < min_i) return .gt;
+    if (b == std.math.trunc(b)) {
+        const bi: i64 = @intFromFloat(b);
+        return std.math.order(a, bi);
+    }
+    const floor: i64 = @intFromFloat(@floor(b));
+    return switch (std.math.order(a, floor)) {
+        .eq => .lt, // a == floor(b) < b
+        else => |o| o,
+    };
+}
+
+pub fn cmpTotal(a: ir.Value, b: ir.Value) std.math.Order {
+    const ra = valueRank(a);
+    const rb = valueRank(b);
+    if (ra != rb) return std.math.order(ra, rb);
+    switch (a) {
+        .null => return .eq,
+        .bool => |x| {
+            const y = b.bool;
+            return if (x == y) .eq else if (!x and y) .lt else .gt;
+        },
+        .int => |x| switch (b) {
+            .int => |y| return std.math.order(x, y),
+            .float => |y| return cmpIntFloat(x, y),
+            else => unreachable,
+        },
+        .float => |x| switch (b) {
+            .int => |y| return reverseOrder(cmpIntFloat(y, x)),
+            .float => |y| return totalOrdF64(x, y),
+            else => unreachable,
+        },
+        .str => |x| {
+            const y = b.str;
+            return std.mem.order(u8, x, y);
+        },
+        .arr => |xs| {
+            const ys = b.arr;
+            var i: usize = 0;
+            while (i < xs.len and i < ys.len) : (i += 1) {
+                const c = cmpTotal(xs[i], ys[i]);
+                if (c != .eq) return c;
+            }
+            return std.math.order(xs.len, ys.len);
+        },
+        .doc => |xs| {
+            const ys = b.doc;
+            var i: usize = 0;
+            while (i < xs.len and i < ys.len) : (i += 1) {
+                const kc = std.mem.order(u8, xs[i].key, ys[i].key);
+                if (kc != .eq) return kc;
+                const c = cmpTotal(xs[i].value, ys[i].value);
+                if (c != .eq) return c;
+            }
+            return std.math.order(xs.len, ys.len);
+        },
+        .vector => |xs| {
+            const ys = b.vector;
+            var i: usize = 0;
+            while (i < xs.len and i < ys.len) : (i += 1) {
+                const c = totalOrdF32(xs[i], ys[i]);
+                if (c != .eq) return c;
+            }
+            return std.math.order(xs.len, ys.len);
+        },
+        .ref => |x| return cmpRecordId(x, b.ref),
+    }
+}
+
+/// Exact value equality (`Value`'s derived PartialEq — used by `=`, `IN`).
+/// Same variant required (Int(1) != Float(1.0)); strings compare by bytes;
+/// NaN != NaN (IEEE), -0.0 == 0.0.
+pub fn valueEql(a: ir.Value, b: ir.Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    switch (a) {
+        .null => return true,
+        .bool => |x| return x == b.bool,
+        .int => |x| return x == b.int,
+        .float => |x| return x == b.float,
+        .str => |x| return std.mem.eql(u8, x, b.str),
+        .doc => |xs| {
+            const ys = b.doc;
+            if (xs.len != ys.len) return false;
+            for (xs, ys) |x, y| {
+                if (!std.mem.eql(u8, x.key, y.key)) return false;
+                if (!valueEql(x.value, y.value)) return false;
+            }
+            return true;
+        },
+        .arr => |xs| {
+            const ys = b.arr;
+            if (xs.len != ys.len) return false;
+            for (xs, ys) |x, y| {
+                if (!valueEql(x, y)) return false;
+            }
+            return true;
+        },
+        .vector => |xs| {
+            const ys = b.vector;
+            if (xs.len != ys.len) return false;
+            for (xs, ys) |x, y| {
+                if (x != y) return false; // NaN != NaN, -0.0 == 0.0
+            }
+            return true;
+        },
+        .ref => |x| return ir.recordIdEql(x, b.ref),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic cosine (issue #134 — the shared reference algorithm)
+// ---------------------------------------------------------------------------
+
+pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
+    const n = @min(a.len, b.len);
+    var dot: f32 = 0.0;
+    var na: f32 = 0.0;
+    var nb: f32 = 0.0;
+    for (0..n) |i| {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if (na == 0.0 or nb == 0.0) return 0.0;
+    return dot / (@sqrt(na) * @sqrt(nb));
+}
+
+// ---------------------------------------------------------------------------
+// Execution
+// ---------------------------------------------------------------------------
+
+/// Execute a whole plan; one result per read statement.
+pub fn executePlan(store: *EngineStore, plan: []const ir.Statement) EngineError![]QueryResult {
+    var results: std.ArrayList(QueryResult) = .empty;
+    var current_memory: ?[]const u8 = null;
+    for (plan) |stmt| {
+        if (try executeInContext(store, stmt, &current_memory)) |res| {
+            try results.append(store.gpa, res);
+        }
+    }
+    return results.items;
+}
+
+fn executeInContext(
+    store: *EngineStore,
+    stmt: ir.Statement,
+    current_memory: *?[]const u8,
+) EngineError!?QueryResult {
+    switch (stmt) {
+        .memory => |m| {
+            _ = try store.memorySlot(m.name);
+            current_memory.* = m.name;
+            return null;
+        },
+        .context_reset => {
+            current_memory.* = null;
+            return null;
+        },
+        else => {},
+    }
+    if (current_memory.*) |name| {
+        const mem = try store.memoryMut(name);
+        return executeStatement(mem, stmt);
+    }
+    return executeStatement(store, stmt);
+}
+
+fn executeStatement(store: *EngineStore, stmt: ir.Statement) EngineError!?QueryResult {
+    switch (stmt) {
+        .memory => return EngineError.MemoryWithoutContext,
+        .context_reset => return null,
+        .create_table => |c| {
+            try store.upsertTable(c.table, c.vector_dim);
+            try store.logMutation(stmt);
+            return null;
+        },
+        .insert => |rec| {
+            try validateEmbedding(store, rec);
+            var stamped = rec;
+            if (stamped.created_at == 0) stamped.created_at = store.clock + 1;
+            try store.insert(stamped);
+            try store.logMutation(stmt);
+            return null;
+        },
+        .relate => |e| {
+            var stamped = e;
+            if (stamped.created_at == 0) stamped.created_at = store.clock + 1;
+            try store.edges.append(store.gpa, stamped);
+            try store.logMutation(stmt);
+            return null;
+        },
+        .forget => |f| {
+            store.remove(f.id);
+            var i: usize = 0;
+            while (i < store.edges.items.len) {
+                const e = store.edges.items[i];
+                if (ir.recordIdEql(e.from, f.id) or ir.recordIdEql(e.to, f.id)) {
+                    _ = store.edges.orderedRemove(i);
+                } else i += 1;
+            }
+            try store.logMutation(stmt);
+            return null;
+        },
+        .select => |sel| {
+            const rows = try runSelect(store, sel);
+            return .{ .kind = .select, .rows = rows };
+        },
+        // M7 surface (graph/temporal) — not reachable from the M3 corpus.
+        .match_path, .match_count, .closure, .prune_history, .snapshot, .history_since => return EngineError.NotImplemented,
+    }
+}
+
+fn validateEmbedding(store: *EngineStore, rec: ir.Record) EngineError!void {
+    const dim = store.dimOf(rec.id.table) orelse return;
+    if (rec.embedding) |emb| {
+        if (emb.len != dim) return EngineError.EmbeddingDimMismatch;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SELECT pipeline
+// ---------------------------------------------------------------------------
+
+fn bodyGet(body: []const ir.DocEntry, key: []const u8) ?ir.Value {
+    for (body) |e| {
+        if (std.mem.eql(u8, e.key, key)) return e.value;
+    }
+    return null;
+}
+
+fn bodyHas(body: []const ir.DocEntry, key: []const u8) bool {
+    for (body) |e| {
+        if (std.mem.eql(u8, e.key, key)) return true;
+    }
+    return false;
+}
+
+fn runSelect(store: *EngineStore, sel: ir.Select) EngineError![]Row {
+    // Candidates: canonical record order, table + filter.
+    var candidates: std.ArrayList(ir.Record) = .empty;
+    for (store.records.items) |rec| {
+        if (!std.mem.eql(u8, rec.id.table, sel.table)) continue;
+        if (!matchesFilter(rec, sel.filter)) continue;
+        try candidates.append(store.gpa, rec);
+    }
+
+    // SELECT COUNT(*) — before scoring/ordering/paging/projection.
+    if (sel.aggregate) |agg| {
+        switch (agg) {
+            .count_star => {
+                const row = try store.gpa.alloc(Row, 1);
+                row[0] = try countRow(store.gpa, sel.table, candidates.items.len);
+                return row;
+            },
+        }
+    }
+
+    // kNN: exact cosine over embedded candidates (score desc, id asc, k=all).
+    var knn_sims: std.ArrayList(Scored) = .empty;
+    if (sel.knn) |knn| {
+        var scored: std.ArrayList(Scored) = .empty;
+        for (candidates.items) |rec| {
+            if (rec.embedding) |emb| {
+                try scored.append(store.gpa, .{ .id = rec.id, .s = cosineSimilarity(emb, knn.query) });
+            }
+        }
+        sortScoredDesc(scored.items);
+        if (scored.items.len > candidates.items.len) scored.items.len = candidates.items.len;
+        knn_sims = scored;
+    }
+
+    // BM25 over the filtered candidates.
+    var bm25_index: ?bm25mod.Bm25Index = null;
+    var bm25_tokens: []const []const u8 = &[_][]const u8{};
+    if (sel.filter) |f| {
+        switch (f) {
+            .bm25 => |b| {
+                bm25_index = try bm25mod.Bm25Index.new(store.gpa, b.field, candidates.items);
+                bm25_tokens = try bm25mod.tokenize(store.gpa, b.query);
+            },
+            else => {},
+        }
+    }
+
+    // Hybrid RRF fusion (K=60, rank 1-based, tie-break id asc).
+    var hybrid: std.ArrayList(Fused) = .empty;
+    if (sel.knn != null and bm25_index != null) {
+        const idx = &bm25_index.?;
+        var lexical: std.ArrayList(Scored) = .empty;
+        for (candidates.items) |rec| {
+            try lexical.append(store.gpa, .{ .id = rec.id, .s = idx.score(rec.id, bm25_tokens) });
+        }
+        sortScoredDesc(lexical.items);
+        for (lexical.items, 0..) |e, rank| {
+            try upsertFused(&hybrid, store.gpa, e.id, 1.0 / (60.0 + @as(f32, @floatFromInt(rank + 1))));
+        }
+        var vector_l: std.ArrayList(Scored) = .empty;
+        for (candidates.items) |rec| {
+            const s: f32 = for (knn_sims.items) |kv| {
+                if (ir.recordIdEql(kv.id, rec.id)) break kv.s;
+            } else 0.0;
+            try vector_l.append(store.gpa, .{ .id = rec.id, .s = s });
+        }
+        sortScoredDesc(vector_l.items);
+        for (vector_l.items, 0..) |e, rank| {
+            try upsertFused(&hybrid, store.gpa, e.id, 1.0 / (60.0 + @as(f32, @floatFromInt(rank + 1))));
+        }
+    }
+
+    // Score every candidate.
+    var rows: std.ArrayList(Row) = .empty;
+    for (candidates.items) |rec| {
+        const score = computeScore(store, sel, rec, knn_sims.items, &bm25_index, bm25_tokens, hybrid.items);
+        try rows.append(store.gpa, .{ .record = rec, .score = score });
+    }
+
+    // ORDER BY <field> typo guard: rows nonempty + no record of the TABLE
+    // carries the key → fail loudly (empty results skip the check).
+    if (sel.order) |ord| {
+        switch (ord) {
+            .field => |f| {
+                if (rows.items.len > 0) {
+                    var any = false;
+                    for (store.records.items) |r| {
+                        if (std.mem.eql(u8, r.id.table, sel.table) and bodyHas(r.body, f.key)) {
+                            any = true;
+                            break;
+                        }
+                    }
+                    if (!any) return EngineError.UnknownSortField;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try orderRows(rows.items, sel);
+
+    if (sel.offset) |off| {
+        const skip = @min(off, rows.items.len);
+        var i: usize = 0;
+        while (i < skip) : (i += 1) _ = rows.orderedRemove(0);
+    }
+    if (effectiveLimit(sel)) |cap| {
+        if (rows.items.len > cap) rows.items.len = cap;
+    }
+
+    // Field projection (presentation only, after ordering/paging).
+    if (sel.fields) |fields| {
+        for (rows.items) |*row| {
+            var kept: std.ArrayList(ir.DocEntry) = .empty;
+            for (row.record.body) |e| {
+                for (fields) |f| {
+                    if (std.mem.eql(u8, f, e.key)) {
+                        try kept.append(store.gpa, e);
+                        break;
+                    }
+                }
+            }
+            row.record.body = kept.items;
+        }
+    }
+    return rows.items;
+}
+
+fn upsertFused(
+    list: *std.ArrayList(Fused),
+    gpa: std.mem.Allocator,
+    id: ir.RecordId,
+    add: f32,
+) !void {
+    for (list.items) |*e| {
+        if (ir.recordIdEql(e.id, id)) {
+            e.fused += add;
+            return;
+        }
+    }
+    try list.append(gpa, .{ .id = id, .fused = add });
+}
+
+fn sortScoredDesc(items: []Scored) void {
+    // Insertion sort — total order (score desc, id asc); corpus-sized inputs.
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        const x = items[i];
+        var j = i;
+        while (j > 0 and scoredBefore(x, items[j - 1])) : (j -= 1) {
+            items[j] = items[j - 1];
+        }
+        items[j] = x;
+    }
+}
+
+fn scoredBefore(a: Scored, b: Scored) bool {
+    // score descending; equal (or NaN) → id ascending (partial_cmp
+    // unwrap_or(Equal) semantics of the reference).
+    if (a.s > b.s) return true;
+    if (a.s < b.s) return false;
+    return ir.RecordId.less(a.id, b.id);
+}
+
+fn countRow(gpa: std.mem.Allocator, table: []const u8, n: usize) EngineError!Row {
+    const body = try gpa.alloc(ir.DocEntry, 1);
+    body[0] = .{ .key = "count", .value = .{ .int = @intCast(n) } };
+    return .{
+        .record = .{
+            .id = .{ .table = table, .id = .{ .str = "count" } },
+            .body = body,
+            .embedding = null,
+            .created_at = 0,
+        },
+        .score = 0.0,
+    };
+}
+
+fn effectiveLimit(sel: ir.Select) ?usize {
+    var caps: [3]?usize = .{ null, null, null };
+    if (sel.knn) |k| caps[0] = k.k;
+    if (sel.filter) |f| {
+        switch (f) {
+            .bm25 => |b| caps[1] = b.k,
+            else => {},
+        }
+    }
+    caps[2] = sel.limit;
+    var best: ?usize = null;
+    for (caps) |c| {
+        if (c) |v| best = if (best) |b| @min(b, v) else v;
+    }
+    return best;
+}
+
+// ---------------------------------------------------------------------------
+// Filters
+// ---------------------------------------------------------------------------
+
+fn matchesFilter(rec: ir.Record, filter: ?ir.Filter) bool {
+    const f = filter orelse return true;
+    switch (f) {
+        .has_embedding => return rec.embedding != null,
+        .bm25 => return true, // scoring filter: never prunes
+        .and_filter => |terms| {
+            for (terms) |t| {
+                if (!matchesFilter(rec, t)) return false;
+            }
+            return true;
+        },
+        .field_equals, .field_cmp, .field_in, .field_between => {
+            // `id` pseudo-field binds to record identity, not a body key.
+            if (predicateField(f)) |pf| {
+                if (std.mem.eql(u8, pf, "id")) return recordIdMatches(rec, f);
+            }
+            return matchesFieldPred(rec.body, f);
+        },
+    }
+}
+
+fn predicateField(f: ir.Filter) ?[]const u8 {
+    switch (f) {
+        .field_equals => |x| return x.field,
+        .field_cmp => |x| return x.field,
+        .field_in => |x| return x.field,
+        .field_between => |x| return x.field,
+        else => return null,
+    }
+}
+
+fn recordIdMatches(rec: ir.Record, f: ir.Filter) bool {
+    const me = ir.recordIdDisplay(std.heap.page_allocator, rec.id) catch unreachable;
+    defer std.heap.page_allocator.free(me);
+    const isMe = struct {
+        fn call(v: ir.Value, s: []const u8) bool {
+            return switch (v) {
+                .str => |x| std.mem.eql(u8, x, s),
+                else => false,
+            };
+        }
+    }.call;
+    switch (f) {
+        .field_equals => |x| return isMe(x.value, me),
+        .field_cmp => |x| {
+            if (x.op == .ne) return !isMe(x.value, me);
+            return false; // ordered forms are parse-rejected for `id`
+        },
+        .field_in => |x| {
+            for (x.values) |v| {
+                if (isMe(v, me)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
+}
+
+fn matchesFieldPred(props: []const ir.DocEntry, f: ir.Filter) bool {
+    switch (f) {
+        .field_equals => |x| {
+            const lhs = bodyGet(props, x.field) orelse return false;
+            return valueEql(lhs, x.value);
+        },
+        .field_cmp => |x| {
+            const lhs = bodyGet(props, x.field) orelse return false;
+            const c = cmpTotal(lhs, x.value);
+            return switch (x.op) {
+                .ne => c != .eq,
+                .lt => c == .lt,
+                .le => c != .gt,
+                .gt => c == .gt,
+                .ge => c != .lt,
+            };
+        },
+        .field_in => |x| {
+            const lhs = bodyGet(props, x.field) orelse return false;
+            for (x.values) |v| {
+                if (valueEql(lhs, v)) return true;
+            }
+            return false;
+        },
+        .field_between => |x| {
+            const lhs = bodyGet(props, x.field) orelse return false;
+            return cmpTotal(lhs, x.lo) != .lt and cmpTotal(lhs, x.hi) != .gt;
+        },
+        .has_embedding, .bm25 => return true,
+        .and_filter => |terms| {
+            for (terms) |t| {
+                if (!matchesFieldPred(props, t)) return false;
+            }
+            return true;
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ordering + scoring
+// ---------------------------------------------------------------------------
+
+fn orderRows(rows: []Row, sel: ir.Select) EngineError!void {
+    // ORDER BY <field> [DESC] — structural sort, id tie both ways.
+    if (sel.order) |ord| {
+        switch (ord) {
+            .field => |f| {
+                insertionSort(Row, rows, f, struct {
+                    fn less(c: @TypeOf(f), a: Row, b: Row) bool {
+                        const ka = bodyGet(a.record.body, c.key) orelse .null;
+                        const kb = bodyGet(b.record.body, c.key) orelse .null;
+                        var o = cmpTotal(ka, kb);
+                        if (c.desc) o = reverseOrder(o);
+                        if (o != .eq) return o == .lt;
+                        return ir.RecordId.less(a.record.id, b.record.id);
+                    }
+                }.less);
+                return;
+            },
+            .recency => {
+                insertionSort(Row, rows, {}, struct {
+                    fn less(_: void, a: Row, b: Row) bool {
+                        const c = std.math.order(b.record.created_at, a.record.created_at);
+                        if (c != .eq) return c == .lt;
+                        return ir.RecordId.less(a.record.id, b.record.id);
+                    }
+                }.less);
+                return;
+            },
+            else => {},
+        }
+    }
+    // Score-based: explicit order, or implicit via kNN / BM25.
+    var bm25_filter = false;
+    if (sel.filter) |f| bm25_filter = f == .bm25;
+    const score_based = sel.order != null or sel.knn != null or bm25_filter;
+    if (score_based) {
+        insertionSort(Row, rows, {}, struct {
+            fn less(_: void, a: Row, b: Row) bool {
+                if (a.score > b.score) return true;
+                if (a.score < b.score) return false;
+                // Equal or NaN → id ascending (Rust partial_cmp semantics).
+                return ir.RecordId.less(a.record.id, b.record.id);
+            }
+        }.less);
+    }
+    // else: BTree key order already (candidates came canonical).
+}
+
+fn reverseOrder(o: std.math.Order) std.math.Order {
+    return switch (o) {
+        .lt => .gt,
+        .eq => .eq,
+        .gt => .lt,
+    };
+}
+
+fn insertionSort(comptime T: type, items: []T, ctx: anytype, lessFn: fn (@TypeOf(ctx), T, T) bool) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        const x = items[i];
+        var j = i;
+        while (j > 0 and lessFn(ctx, x, items[j - 1])) : (j -= 1) {
+            items[j] = items[j - 1];
+        }
+        items[j] = x;
+    }
+}
+
+fn clamp01(x: f32) f32 {
+    if (x < 0.0) return 0.0;
+    if (x > 1.0) return 1.0;
+    return x;
+}
+
+fn computeScore(
+    store: *EngineStore,
+    sel: ir.Select,
+    rec: ir.Record,
+    knn_sims: []const Scored,
+    bm25_index: *const ?bm25mod.Bm25Index,
+    bm25_tokens: []const []const u8,
+    hybrid: []const Fused,
+) f32 {
+    // Hybrid fusion dominates every score source.
+    for (hybrid) |h| {
+        if (ir.recordIdEql(h.id, rec.id)) return h.fused;
+    }
+    // BM25 filter dominates ORDER BY / kNN.
+    if (sel.filter) |f| {
+        switch (f) {
+            .bm25 => {
+                if (bm25_index.*) |idx| return idx.score(rec.id, bm25_tokens);
+            },
+            else => {},
+        }
+    }
+    var similarity: f32 = 0.0;
+    if (sel.knn != null) {
+        for (knn_sims) |kv| {
+            if (ir.recordIdEql(kv.id, rec.id)) {
+                similarity = kv.s;
+                break;
+            }
+        }
+    }
+    const ord = sel.order orelse return similarity;
+    switch (ord) {
+        .score => return scoreOf(store, rec),
+        .votes => return @floatFromInt(voteCounts(store, rec.id).net),
+        .feedback => return feedbackScore(store, rec.id),
+        .salience => {
+            if (sel.knn != null) return 0.7 * similarity + 0.3 * clamp01(scoreOf(store, rec));
+            return clamp01(scoreOf(store, rec));
+        },
+        .salience_weighted => |w| {
+            const alpha = w[0];
+            const beta = w[1];
+            const gamma = w[2];
+            const delta = w[3];
+            return alpha * similarity +
+                beta * strengthOf(store, rec) +
+                gamma * importanceOf(rec) +
+                delta * clamp01(scoreOf(store, rec));
+        },
+        else => return similarity,
+    }
+}
+
+/// Tolerant edge-name match (leading `:` on either side, issue #98).
+fn edgeNameMatches(stored: []const u8, want: []const u8) bool {
+    const st = trimColons(stored);
+    const w = trimColons(want);
+    return std.mem.eql(u8, st, w);
+}
+
+fn trimColons(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len and s[i] == ':') i += 1;
+    return s[i..];
+}
+
+const VoteCounts = struct { up: u64, down: u64, net: i64 };
+
+fn voteWeight(e: ir.RelationEdge) f32 {
+    if (e.weight) |w| return w;
+    const v = bodyGet(e.props, "value") orelse return 1.0;
+    return switch (v) {
+        .int => |n| @floatFromInt(n),
+        .float => |f| @floatCast(f),
+        else => 1.0,
+    };
+}
+
+fn voteValue(props: []const ir.DocEntry) i8 {
+    const v = bodyGet(props, "value") orelse return 0;
+    return switch (v) {
+        .int => |n| if (n == 1) 1 else if (n == -1) -1 else 0,
+        .float => |f| if (f == 1.0) 1 else if (f == -1.0) -1 else 0,
+        else => 0,
+    };
+}
+
+fn voteCounts(store: *EngineStore, id: ir.RecordId) VoteCounts {
+    var up: u64 = 0;
+    var down: u64 = 0;
+    for (store.edges.items) |e| {
+        if (!edgeNameMatches(e.name, "voted")) continue;
+        if (!ir.recordIdEql(e.to, id)) continue;
+        switch (voteValue(e.props)) {
+            1 => up += 1,
+            -1 => down += 1,
+            else => {},
+        }
+    }
+    return .{ .up = up, .down = down, .net = @as(i64, @intCast(up)) - @as(i64, @intCast(down)) };
+}
+
+/// Laplace-smoothed mean of `:voted` weights: (sum + 1) / (n + 2).
+fn scoreOf(store: *EngineStore, rec: ir.Record) f32 {
+    var sum: f32 = 0.0;
+    var n: f32 = 0.0;
+    for (store.edges.items) |e| {
+        if (edgeNameMatches(e.name, "voted") and ir.recordIdEql(e.to, rec.id)) {
+            sum += voteWeight(e);
+            n += 1.0;
+        }
+    }
+    return (sum + 1.0) / (n + 2.0);
+}
+
+/// β term: strength(recency, freq) in [0, 1].
+fn strengthOf(store: *EngineStore, rec: ir.Record) f32 {
+    const age_raw = store.clock - rec.created_at;
+    const age: f32 = @floatFromInt(if (age_raw > 0) age_raw else 0);
+    const recency: f32 = 1.0 / (1.0 + age);
+    var inc: f32 = 0.0;
+    for (store.edges.items) |e| {
+        if (ir.recordIdEql(e.from, rec.id) or ir.recordIdEql(e.to, rec.id)) inc += 1.0;
+    }
+    return 0.5 * recency + 0.5 * (inc / (inc + 1.0));
+}
+
+/// γ term: the agent-written `importance` field clamped to [0, 1].
+fn importanceOf(rec: ir.Record) f32 {
+    const v = bodyGet(rec.body, "importance") orelse return 0.0;
+    const f: f32 = switch (v) {
+        .float => |x| @floatCast(x),
+        .int => |x| @floatFromInt(x),
+        else => return 0.0,
+    };
+    return clamp01(f);
+}
+
+/// Time-decayed feedback over `:voted` edges; `now` = max voted created_at.
+fn feedbackScore(store: *EngineStore, id: ir.RecordId) f32 {
+    const lambda: f32 = 1.0;
+    var now: ?i64 = null;
+    for (store.edges.items) |e| {
+        if (edgeNameMatches(e.name, "voted")) {
+            now = if (now) |n| @max(n, e.created_at) else e.created_at;
+        }
+    }
+    const now_v = now orelse return 0.0;
+    var total: f32 = 0.0;
+    for (store.edges.items) |e| {
+        if (!edgeNameMatches(e.name, "voted")) continue;
+        if (!ir.recordIdEql(e.to, id)) continue;
+        const sign: f32 = @floatFromInt(voteValue(e.props));
+        const age_raw = now_v - e.created_at;
+        const age: f32 = @floatFromInt(if (age_raw > 0) age_raw else 0);
+        total += sign * (1.0 / (1.0 + lambda * age));
+    }
+    return total;
+}
+
+test "cosine reference vectors" {
+    try std.testing.expectEqual(@as(f32, 1.0), cosineSimilarity(&[_]f32{ 1.0, 0.0 }, &[_]f32{ 1.0, 0.0 }));
+    try std.testing.expectEqual(@as(f32, 0.0), cosineSimilarity(&[_]f32{ 0.0, 0.0 }, &[_]f32{ 1.0, 0.0 }));
+}
+
+test "cmp_total ranks types" {
+    const std2 = @import("std");
+    _ = std2;
+    try std.testing.expect(cmpTotal(.null, .{ .bool = false }) == .lt);
+    try std.testing.expect(cmpTotal(.{ .int = 1 }, .{ .float = 1.0 }) == .eq);
+    try std.testing.expect(cmpTotal(.{ .float = 2.5 }, .{ .int = 2 }) == .gt);
+    try std.testing.expect(cmpTotal(.{ .str = "a" }, .{ .int = 999 }) == .gt);
+}

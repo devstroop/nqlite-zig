@@ -14,6 +14,9 @@ pub const crc32 = @import("crc32.zig");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const analyzer = @import("analyzer.zig");
+// M3: the deterministic in-memory engine.
+pub const engine = @import("engine.zig");
+pub const bm25 = @import("bm25.zig");
 
 // Run every imported file's tests (zig runs tests of files reachable from
 // the root module).
@@ -27,6 +30,9 @@ test {
     _ = @import("parser.zig");
     _ = @import("analyzer.zig");
     _ = @import("corpus.zig");
+    _ = @import("engine.zig");
+    _ = @import("bm25.zig");
+    _ = @import("results.zig");
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
