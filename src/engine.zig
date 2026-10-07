@@ -41,6 +41,7 @@ pub const QueryKind = union(enum) {
     select: []const u8, // table name
     match_: ir.MatchPath,
     closure: ir.MatchPath,
+    history: i64, // `HISTORY SINCE <since>` cutoff (issue #118)
 };
 
 pub const Row = struct {
@@ -372,7 +373,14 @@ pub fn executeInContext(
     }
     if (current_memory.*) |name| {
         const mem = try store.memoryMut(name);
-        return executeStatement(mem, stmt);
+        mem.err = null;
+        return executeStatement(mem, stmt) catch |e| {
+            // Surface the block's rich failure on the store the server
+            // reads (`self.store.err`) — parity with the reference, whose
+            // Result-based errors carry the message regardless of scope.
+            if (store.err == null) store.err = mem.err;
+            return e;
+        };
     }
     return executeStatement(store, stmt);
 }
@@ -464,13 +472,20 @@ fn executeStatement(store: *EngineStore, stmt: ir.Statement) EngineError!?QueryR
             }
             return null;
         },
-        // Not used by the E01–E05 gate (M7 surface: PRUNE / HISTORY SINCE).
-        .prune_history, .history_since => {
-            store.err = .{
-                .variant = "NotImplemented",
-                .message = "statement not implemented yet (M7)",
-            };
-            return EngineError.NotImplemented;
+        // History compaction (issue #95): snapshot the current state
+        // (memories depth-first) and keep only declarations + the
+        // snapshot. No clock bump — the snapshot is stamped at the
+        // current clock, and PRUNE never logs itself.
+        .prune_history => {
+            try pruneHistory(store);
+            return null;
+        },
+        // Exact delta read (issue #118): one row per mutation strictly
+        // after the cutoff; snapshots are compaction bookkeeping and
+        // are never reported as mutations.
+        .history_since => |since| {
+            const rows = try historySince(store, since);
+            return .{ .kind = .{ .history = since }, .rows = rows };
         },
     }
 }
@@ -838,15 +853,7 @@ fn temporalView(
 ) EngineError!*EngineStore {
     const cutoff = as_of orelse return root;
     if (compactionHorizon(root)) |snap_ts| {
-        if (cutoff < snap_ts) {
-            const m = std.fmt.allocPrint(
-                gpa,
-                "history before ts {d} was compacted (PRUNE HISTORY); AS OF / HISTORY SINCE timestamps earlier than the snapshot are no longer available",
-                .{snap_ts},
-            ) catch "history pruned";
-            root.err = .{ .variant = "HistoryPruned", .message = m };
-            return EngineError.HistoryPruned;
-        }
+        if (cutoff < snap_ts) return failPruned(gpa, root, snap_ts);
     }
     out.* = try replayAsOf(gpa, root, cutoff);
     return &out.*.?;
@@ -861,6 +868,196 @@ fn replayAsOf(gpa: std.mem.Allocator, src: *const EngineStore, cutoff: i64) Engi
         _ = try executeStatement(&view, h.stmt);
     }
     return view;
+}
+
+/// The loud retention contract (issues #95/#118), shared by `AS OF` and
+/// `HISTORY SINCE`: a cutoff below the compaction horizon cannot be
+/// answered — fail loudly rather than return a partial view/delta.
+fn failPruned(gpa: std.mem.Allocator, store: *EngineStore, snap_ts: i64) EngineError {
+    const m = std.fmt.allocPrint(
+        gpa,
+        "history before ts {d} was compacted (PRUNE HISTORY); AS OF / HISTORY SINCE timestamps earlier than the snapshot are no longer available",
+        .{snap_ts},
+    ) catch "history pruned";
+    store.err = .{ .variant = "HistoryPruned", .message = m };
+    return EngineError.HistoryPruned;
+}
+
+/// `PRUNE HISTORY` (issue #95): replace the history with the CreateTable
+/// declarations it contained (original timestamps — the only record of
+/// decl-only/dim-less tables) plus one Snapshot at the current clock.
+/// Memories are pruned depth-first first, so embedded stores arrive
+/// already compact. Deterministic and bounded: re-prune rebuilds the
+/// snapshot in place instead of stacking them. Does NOT bump the clock.
+fn pruneHistory(store: *EngineStore) EngineError!void {
+    for (store.memories.items) |*m| try pruneHistory(&m.store);
+    const gpa = store.gpa;
+    var decls: std.ArrayList(ir.HistoryEntry) = .empty;
+    for (store.history.items) |h| {
+        if (h.stmt == .create_table) try decls.append(gpa, h);
+    }
+    const st = ir.SnapshotState{
+        .records = store.records.items,
+        .edges = store.edges.items,
+        .vector_dims = try dimEntriesOf(store),
+        .clock = store.clock,
+        .memories = try snapMemoriesOf(store),
+        .tables = try sortedTablesOf(store),
+    };
+    store.history = decls;
+    try store.history.append(gpa, .{ .ts = store.clock, .stmt = .{ .snapshot = st } });
+}
+
+/// Table declarations in BTree (name-ascending) order — the reference
+/// stores them in a BTreeMap, so snapshot bytes must sort the same way.
+fn sortedTablesOf(store: *const EngineStore) EngineError![]const ir.TableEntry {
+    const out = try store.gpa.alloc(ir.TableEntry, store.tables.items.len);
+    @memcpy(out, store.tables.items);
+    insertionSort(ir.TableEntry, out, {}, struct {
+        fn less(_: void, a: ir.TableEntry, b: ir.TableEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.less);
+    return out;
+}
+
+/// `Store.vector_dims` — only tables with a declared dim, name-ascending.
+fn dimEntriesOf(store: *const EngineStore) EngineError![]const ir.DimEntry {
+    var n: usize = 0;
+    for (store.tables.items) |t| {
+        if (t.vector_dim != null) n += 1;
+    }
+    const out = try store.gpa.alloc(ir.DimEntry, n);
+    var i: usize = 0;
+    for (store.tables.items) |t| {
+        if (t.vector_dim) |d| {
+            out[i] = .{ .name = t.name, .dim = d };
+            i += 1;
+        }
+    }
+    insertionSort(ir.DimEntry, out, {}, struct {
+        fn less(_: void, a: ir.DimEntry, b: ir.DimEntry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.less);
+    return out;
+}
+
+/// Memory blocks as embedded in a snapshot — each with its own already-
+/// pruned history riding along (`SnapStore` has no `tables`; the install
+/// path rebuilds declarations from the retained CREATE statements).
+fn snapMemoriesOf(store: *const EngineStore) EngineError![]const ir.SnapMemory {
+    const out = try store.gpa.alloc(ir.SnapMemory, store.memories.items.len);
+    for (out, 0..) |*slot, i| {
+        const m = &store.memories.items[i];
+        slot.* = .{
+            .name = m.name,
+            .store = .{
+                .records = m.store.records.items,
+                .edges = m.store.edges.items,
+                .vector_dims = try dimEntriesOf(&m.store),
+                .clock = m.store.clock,
+                .history = m.store.history.items,
+                .memories = try snapMemoriesOf(&m.store),
+            },
+        };
+    }
+    return out;
+}
+
+/// `HISTORY SINCE <ts>` (issue #118): every mutation strictly after the
+/// cutoff, in append (ts-ascending) order — one row per entry carrying
+/// the mutation kind and its subject ids, so a sync consumer sees
+/// changed rows AND changed edges (plus tombstones) in one read. The
+/// PRUNE retention horizon applies (same `HistoryPruned` contract as
+/// `AS OF`); snapshot entries are compaction bookkeeping, never reported.
+fn historySince(store: *EngineStore, since: i64) EngineError![]Row {
+    if (compactionHorizon(store)) |snap_ts| {
+        if (since < snap_ts) return failPruned(store.gpa, store, snap_ts);
+    }
+    var rows: std.ArrayList(Row) = .empty;
+    for (store.history.items) |h| {
+        if (h.ts <= since) continue; // exclusive cutoff
+        if (h.stmt == .snapshot) continue;
+        try rows.append(store.gpa, try historyRow(store, h));
+    }
+    return rows.items;
+}
+
+/// One delta row: `history:<ts>` id, score = ts, body = {subject fields…,
+/// kind, ts} in BTree (byte-ascending key) order — exactly the reference's
+/// BTreeMap<String, Value> rendering.
+fn historyRow(store: *EngineStore, h: ir.HistoryEntry) EngineError!Row {
+    const gpa = store.gpa;
+    var tmp: [6]ir.DocEntry = undefined;
+    var n: usize = 0;
+    const kind: []const u8 = switch (h.stmt) {
+        .create_table => |c| blk: {
+            tmp[n] = .{ .key = "table", .value = .{ .str = c.table } };
+            n += 1;
+            if (c.vector_dim) |d| {
+                tmp[n] = .{ .key = "dim", .value = .{ .int = @intCast(d) } };
+                n += 1;
+            }
+            break :blk "CREATE";
+        },
+        .insert => |rec| blk: {
+            tmp[n] = .{ .key = "id", .value = .{ .str = try ir.recordIdDisplay(gpa, rec.id) } };
+            n += 1;
+            break :blk "INSERT";
+        },
+        .relate => |e| blk: {
+            tmp[n] = .{ .key = "from", .value = .{ .str = try ir.recordIdDisplay(gpa, e.from) } };
+            n += 1;
+            tmp[n] = .{ .key = "to", .value = .{ .str = try ir.recordIdDisplay(gpa, e.to) } };
+            n += 1;
+            tmp[n] = .{ .key = "name", .value = .{ .str = e.name } };
+            n += 1;
+            break :blk "RELATE";
+        },
+        .forget => |f| blk: {
+            tmp[n] = .{ .key = "id", .value = .{ .str = try ir.recordIdDisplay(gpa, f.id) } };
+            n += 1;
+            break :blk "FORGET";
+        },
+        .memory => |m| blk: {
+            tmp[n] = .{ .key = "name", .value = .{ .str = m.name } };
+            n += 1;
+            break :blk "MEMORY";
+        },
+        .prune_history => "PRUNE",
+        .history_since => |s| blk: {
+            tmp[n] = .{ .key = "since", .value = .{ .int = s } };
+            n += 1;
+            break :blk "HISTORY_SINCE";
+        },
+        .context_reset => "CONTEXT_RESET",
+        .select => "SELECT",
+        .match_path, .match_count => "MATCH",
+        .closure => "CLOSURE",
+        .snapshot => unreachable, // skipped by the caller
+    };
+    tmp[n] = .{ .key = "ts", .value = .{ .int = h.ts } };
+    n += 1;
+    tmp[n] = .{ .key = "kind", .value = .{ .str = kind } };
+    n += 1;
+    // Heap-dupe: the returned row's body must outlive this frame (the
+    // server arena owns it — a stack slice here rots across rows).
+    const body = try gpa.alloc(ir.DocEntry, n);
+    @memcpy(body, tmp[0..n]);
+    insertionSort(ir.DocEntry, body, {}, struct {
+        fn less(_: void, a: ir.DocEntry, b: ir.DocEntry) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
+        }
+    }.less);
+    const id = ir.RecordId{
+        .table = "history",
+        .id = .{ .str = try std.fmt.allocPrint(gpa, "{d}", .{h.ts}) },
+    };
+    return .{
+        .record = .{ .id = id, .body = body, .embedding = null, .created_at = h.ts },
+        .score = @floatFromInt(h.ts),
+    };
 }
 
 /// A step's edge-property filter against edge props (spec §2.5): field
