@@ -14,9 +14,11 @@ const ir = @import("ir.zig");
 pub const BUILTIN_TABLES = [_][]const u8{ "global", "meta" };
 
 /// Analysis failure — variant names mirror `nql_ir`'s `AnalysisError`
-/// discriminants (gated by the corpus).
+/// discriminants (gated by the M2 corpus) and `message` is the Rust
+/// `Display` text, byte-exact for the server's `ERR` lines.
 pub const AnalysisFail = struct {
     variant: []const u8,
+    message: []const u8,
 };
 
 pub const Outcome = union(enum) {
@@ -49,10 +51,20 @@ const Ctx = struct {
     }
 
     /// Validate a `table:id` pair: non-empty table, non-empty string id.
-    fn validateRecordId(rid: ir.RecordId) ?AnalysisFail {
-        if (rid.table.len == 0) return .{ .variant = "EmptyTable" };
+    fn validateRecordId(gpa: std.mem.Allocator, rid: ir.RecordId) ?AnalysisFail {
+        if (rid.table.len == 0)
+            return .{ .variant = "EmptyTable", .message = "record id table must not be empty" };
         switch (rid.id) {
-            .str => |s| if (s.len == 0) return .{ .variant = "EmptyId" },
+            .str => |s| {
+                if (s.len == 0) {
+                    const m = std.fmt.allocPrint(
+                        gpa,
+                        "record id in table `{s}` has an empty id string",
+                        .{rid.table},
+                    ) catch "record id has an empty id string";
+                    return .{ .variant = "EmptyId", .message = m };
+                }
+            },
             else => {},
         }
         return null;
@@ -86,34 +98,55 @@ const Ctx = struct {
                 return .{ .stmt = stmt };
             },
             .insert => |rec| {
-                if (validateRecordId(rec.id)) |f| return .{ .fail = f };
-                if (!self.isDeclared(rec.id.table)) return .{ .fail = .{ .variant = "UnknownTableForInsert" } };
+                if (validateRecordId(self.gpa, rec.id)) |f| return .{ .fail = f };
+                if (!self.isDeclared(rec.id.table)) {
+                    const m = std.fmt.allocPrint(
+                        self.gpa,
+                        "INSERT into table `{s}` requires a prior CREATE TABLE statement or a built-in table",
+                        .{rec.id.table},
+                    ) catch "INSERT into undeclared table";
+                    return .{ .fail = .{ .variant = "UnknownTableForInsert", .message = m } };
+                }
                 if (self.dimOf(rec.id.table)) |expected| {
                     if (rec.embedding) |emb| {
-                        if (emb.len != expected) return .{ .fail = .{ .variant = "EmbeddingDimMismatch" } };
+                        if (emb.len != expected) {
+                            const m = std.fmt.allocPrint(
+                                self.gpa,
+                                "INSERT into `{s}` has embedding of dimension {d}, but the table declares VECTOR<f32, {d}>",
+                                .{ rec.id.table, emb.len, expected },
+                            ) catch "embedding dimension mismatch";
+                            return .{ .fail = .{ .variant = "EmbeddingDimMismatch", .message = m } };
+                        }
                     }
                 }
                 return .{ .stmt = stmt };
             },
             .relate => |e| {
-                if (validateRecordId(e.from)) |f| return .{ .fail = f };
-                if (validateRecordId(e.to)) |f| return .{ .fail = f };
+                if (validateRecordId(self.gpa, e.from)) |f| return .{ .fail = f };
+                if (validateRecordId(self.gpa, e.to)) |f| return .{ .fail = f };
                 return .{ .stmt = stmt };
             },
             .match_path => |p| {
-                if (validateRecordId(p.start)) |f| return .{ .fail = f };
+                if (validateRecordId(self.gpa, p.start)) |f| return .{ .fail = f };
                 return .{ .stmt = stmt };
             },
             .match_count => |p| {
-                if (validateRecordId(p.start)) |f| return .{ .fail = f };
+                if (validateRecordId(self.gpa, p.start)) |f| return .{ .fail = f };
                 return .{ .stmt = stmt };
             },
             .closure => |p| {
-                if (validateRecordId(p.start)) |f| return .{ .fail = f };
+                if (validateRecordId(self.gpa, p.start)) |f| return .{ .fail = f };
                 return .{ .stmt = stmt };
             },
             .select => |sel| {
-                if (!self.isDeclared(sel.table)) return .{ .fail = .{ .variant = "UnknownTableForSelect" } };
+                if (!self.isDeclared(sel.table)) {
+                    const m = std.fmt.allocPrint(
+                        self.gpa,
+                        "SELECT on table `{s}` requires a prior CREATE TABLE statement or a built-in table",
+                        .{sel.table},
+                    ) catch "SELECT on undeclared table";
+                    return .{ .fail = .{ .variant = "UnknownTableForSelect", .message = m } };
+                }
                 // Enrich: kNN without ORDER BY gains similarity; explicit
                 // similarity without a kNN vector is an error.
                 var out = sel;
@@ -121,11 +154,14 @@ const Ctx = struct {
                 const order_is_similarity = if (sel.order) |o| o == .similarity else false;
                 if (has_knn and out.order == null) out.order = .similarity;
                 if (order_is_similarity and !has_knn)
-                    return .{ .fail = .{ .variant = "SimilarityWithoutKnn" } };
+                    return .{ .fail = .{
+                        .variant = "SimilarityWithoutKnn",
+                        .message = "ORDER BY similarity requires a kNN query vector (WHERE vector::similarity(...))",
+                    } };
                 return .{ .stmt = .{ .select = out } };
             },
             .forget => |f| {
-                if (validateRecordId(f.id)) |e| return .{ .fail = e };
+                if (validateRecordId(self.gpa, f.id)) |e| return .{ .fail = e };
                 return .{ .stmt = stmt };
             },
             // Pass-throughs: MEMORY, ContextReset (parser can't produce it),

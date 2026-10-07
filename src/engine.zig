@@ -17,7 +17,15 @@ pub const EngineError = error{
     EmbeddingDimMismatch,
     UnknownSortField,
     MemoryWithoutContext,
+    HistoryPruned,
     NotImplemented,
+};
+
+/// Rich failure detail (Rust `Display` text) — set on the store at the
+/// failure site so the line server can emit byte-exact `ERR` lines.
+pub const EngineFail = struct {
+    variant: []const u8,
+    message: []const u8,
 };
 
 /// Corpus-facing error names (mirror the Rust `Error` discriminants).
@@ -25,10 +33,15 @@ pub fn errorVariant(e: EngineError) []const u8 {
     if (e == error.EmbeddingDimMismatch) return "EmbeddingDimMismatch";
     if (e == error.UnknownSortField) return "UnknownSortField";
     if (e == error.MemoryWithoutContext) return "MemoryWithoutContext";
+    if (e == error.HistoryPruned) return "HistoryPruned";
     return "Internal";
 }
 
-pub const QueryKind = enum { select };
+pub const QueryKind = union(enum) {
+    select: []const u8, // table name
+    match_: ir.MatchPath,
+    closure: ir.MatchPath,
+};
 
 pub const Row = struct {
     record: ir.Record,
@@ -57,6 +70,8 @@ pub const EngineStore = struct {
     clock: i64 = 0,
     history: std.ArrayList(ir.HistoryEntry) = .empty,
     memories: std.ArrayList(Memory) = .empty,
+    /// Last rich failure (cleared per server line by the caller).
+    err: ?EngineFail = null,
 
     /// A named memory partition (root-level, like the reference engine).
     pub const Memory = struct {
@@ -68,7 +83,7 @@ pub const EngineStore = struct {
         return .{ .gpa = gpa };
     }
 
-    fn findIndex(self: *EngineStore, id: ir.RecordId) ?usize {
+    fn findIndex(self: *const EngineStore, id: ir.RecordId) ?usize {
         var lo: usize = 0;
         var hi: usize = self.records.items.len;
         while (lo < hi) {
@@ -362,7 +377,15 @@ fn executeInContext(
 
 fn executeStatement(store: *EngineStore, stmt: ir.Statement) EngineError!?QueryResult {
     switch (stmt) {
-        .memory => return EngineError.MemoryWithoutContext,
+        .memory => |m| {
+            const msg = std.fmt.allocPrint(
+                store.gpa,
+                "`MEMORY {s}` must run inside a plan to switch context",
+                .{m.name},
+            ) catch "MEMORY without context";
+            store.err = .{ .variant = "MemoryWithoutContext", .message = msg };
+            return EngineError.MemoryWithoutContext;
+        },
         .context_reset => return null,
         .create_table => |c| {
             try store.upsertTable(c.table, c.vector_dim);
@@ -398,17 +421,99 @@ fn executeStatement(store: *EngineStore, stmt: ir.Statement) EngineError!?QueryR
         },
         .select => |sel| {
             const rows = try runSelect(store, sel);
-            return .{ .kind = .select, .rows = rows };
+            return .{ .kind = .{ .select = sel.table }, .rows = rows };
         },
-        // M7 surface (graph/temporal) — not reachable from the M3 corpus.
-        .match_path, .match_count, .closure, .prune_history, .snapshot, .history_since => return EngineError.NotImplemented,
+        .match_path => |path| {
+            var view: ?EngineStore = null;
+            const target = try temporalView(store.gpa, store, path.as_of, &view);
+            const rows = try runMatch(target, store.gpa, path);
+            return .{ .kind = .{ .match_ = path }, .rows = rows };
+        },
+        .match_count => |path| {
+            var view: ?EngineStore = null;
+            const target = try temporalView(store.gpa, store, path.as_of, &view);
+            const n = runMatchCount(target, path);
+            const row = try store.gpa.alloc(Row, 1);
+            row[0] = try countRow(store.gpa, path.start.table, n);
+            return .{ .kind = .{ .match_ = path }, .rows = row };
+        },
+        .closure => |path| {
+            var view: ?EngineStore = null;
+            const target = try temporalView(store.gpa, store, path.as_of, &view);
+            const rows = try runClosure(target, store.gpa, path);
+            return .{ .kind = .{ .closure = path }, .rows = rows };
+        },
+        // History compaction base: install the captured state (replay-only).
+        .snapshot => |st| {
+            store.records = .empty;
+            for (st.records) |r| try store.insert(r);
+            store.edges = .empty;
+            for (st.edges) |e| try store.edges.append(store.gpa, e);
+            store.tables = .empty;
+            for (st.tables) |t| try store.tables.append(store.gpa, t);
+            store.clock = st.clock;
+            store.history = .empty;
+            store.memories = .empty;
+            for (st.memories) |m| {
+                try store.memories.append(
+                    store.gpa,
+                    .{ .name = m.name, .store = try engineStoreFromSnap(store.gpa, m.store) },
+                );
+            }
+            return null;
+        },
+        // Not used by the E01–E05 gate (M7 surface: PRUNE / HISTORY SINCE).
+        .prune_history, .history_since => {
+            store.err = .{
+                .variant = "NotImplemented",
+                .message = "statement not implemented yet (M7)",
+            };
+            return EngineError.NotImplemented;
+        },
     }
+}
+
+/// Build a live store from a wire-form snapshot store (no `tables` field —
+/// rebuilt from its own history, matching the reference's rebuild rule).
+fn engineStoreFromSnap(gpa: std.mem.Allocator, s: ir.SnapStore) EngineError!EngineStore {
+    var out = EngineStore.init(gpa);
+    for (s.records) |r| try out.insert(r);
+    for (s.edges) |e| try out.edges.append(gpa, e);
+    out.clock = s.clock;
+    for (s.history) |h| try out.history.append(gpa, h);
+    for (s.memories) |m| {
+        try out.memories.append(gpa, .{
+            .name = m.name,
+            .store = try engineStoreFromSnap(gpa, m.store),
+        });
+    }
+    try rebuildTables(&out);
+    return out;
+}
+
+/// Re-declare tables from a store's (and its memories') mutation histories —
+/// the reference's `rebuild_tables` (issue #133) for snapshot installs.
+fn rebuildTables(store: *EngineStore) EngineError!void {
+    for (store.history.items) |h| {
+        if (h.stmt == .create_table) {
+            try store.upsertTable(h.stmt.create_table.table, h.stmt.create_table.vector_dim);
+        }
+    }
+    for (store.memories.items) |*m| try rebuildTables(&m.store);
 }
 
 fn validateEmbedding(store: *EngineStore, rec: ir.Record) EngineError!void {
     const dim = store.dimOf(rec.id.table) orelse return;
     if (rec.embedding) |emb| {
-        if (emb.len != dim) return EngineError.EmbeddingDimMismatch;
+        if (emb.len != dim) {
+            const m = std.fmt.allocPrint(
+                store.gpa,
+                "embedding dimension mismatch for table `{s}`: declared dim {d}, got {d}",
+                .{ rec.id.table, dim, emb.len },
+            ) catch "embedding dimension mismatch";
+            store.err = .{ .variant = "EmbeddingDimMismatch", .message = m };
+            return EngineError.EmbeddingDimMismatch;
+        }
     }
 }
 
@@ -430,7 +535,11 @@ fn bodyHas(body: []const ir.DocEntry, key: []const u8) bool {
     return false;
 }
 
-fn runSelect(store: *EngineStore, sel: ir.Select) EngineError![]Row {
+fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
+    // Temporal read (`AS OF T`): query the replayed historical view.
+    var as_view: ?EngineStore = null;
+    const store: *EngineStore = try temporalView(root.gpa, root, sel.as_of, &as_view);
+
     // Candidates: canonical record order, table + filter.
     var candidates: std.ArrayList(ir.Record) = .empty;
     for (store.records.items) |rec| {
@@ -522,7 +631,15 @@ fn runSelect(store: *EngineStore, sel: ir.Select) EngineError![]Row {
                             break;
                         }
                     }
-                    if (!any) return EngineError.UnknownSortField;
+                    if (!any) {
+                        const m = std.fmt.allocPrint(
+                            store.gpa,
+                            "ORDER BY field `{s}` exists on no record of table `{s}` (typo? rows would sort as all-equal)",
+                            .{ f.key, sel.table },
+                        ) catch "unknown sort field";
+                        store.err = .{ .variant = "UnknownSortField", .message = m };
+                        return EngineError.UnknownSortField;
+                    }
                 }
             },
             else => {},
@@ -623,6 +740,242 @@ fn effectiveLimit(sel: ir.Select) ?usize {
         if (c) |v| best = if (best) |b| @min(b, v) else v;
     }
     return best;
+}
+
+// ---------------------------------------------------------------------------
+// Graph traversal + temporal views (MATCH/CLOSURE/AS OF — the E01–E05 surface)
+// ---------------------------------------------------------------------------
+
+const Walk = struct { id: ir.RecordId, walks: u64 };
+
+fn containsRid(list: []const ir.RecordId, id: ir.RecordId) bool {
+    for (list) |x| {
+        if (ir.recordIdEql(x, id)) return true;
+    }
+    return false;
+}
+
+fn scoredGet(list: []const Scored, id: ir.RecordId) f32 {
+    for (list) |x| {
+        if (ir.recordIdEql(x.id, id)) return x.s;
+    }
+    return 0.0;
+}
+
+fn walkGet(list: []const Walk, id: ir.RecordId) ?u64 {
+    for (list) |x| {
+        if (ir.recordIdEql(x.id, id)) return x.walks;
+    }
+    return null;
+}
+
+fn saturatingAdd(a: u64, b: u64) u64 {
+    const r = a +% b;
+    return if (r < a) std.math.maxInt(u64) else r;
+}
+
+/// The snapshot timestamp of a pruned history (issue #95), if any.
+fn compactionHorizon(store: *const EngineStore) ?i64 {
+    for (store.history.items) |h| {
+        if (h.stmt == .snapshot) return h.ts;
+    }
+    return null;
+}
+
+/// The store a temporal read runs against: the current store, or a replayed
+/// view when `as_of` is present (loud `HistoryPruned` below the horizon).
+fn temporalView(
+    gpa: std.mem.Allocator,
+    root: *EngineStore,
+    as_of: ?i64,
+    out: *?EngineStore,
+) EngineError!*EngineStore {
+    const cutoff = as_of orelse return root;
+    if (compactionHorizon(root)) |snap_ts| {
+        if (cutoff < snap_ts) {
+            const m = std.fmt.allocPrint(
+                gpa,
+                "history before ts {d} was compacted (PRUNE HISTORY); AS OF / HISTORY SINCE timestamps earlier than the snapshot are no longer available",
+                .{snap_ts},
+            ) catch "history pruned";
+            root.err = .{ .variant = "HistoryPruned", .message = m };
+            return EngineError.HistoryPruned;
+        }
+    }
+    out.* = try replayAsOf(gpa, root, cutoff);
+    return &out.*.?;
+}
+
+/// Replay the mutation history up to `cutoff` into a fresh store (pure
+/// function of `(history, cutoff)`; replay is total on valid stores).
+fn replayAsOf(gpa: std.mem.Allocator, src: *const EngineStore, cutoff: i64) EngineError!EngineStore {
+    var view = EngineStore.init(gpa);
+    for (src.history.items) |h| {
+        if (h.ts > cutoff) break;
+        _ = try executeStatement(&view, h.stmt);
+    }
+    return view;
+}
+
+/// A step's edge-property filter against edge props (spec §2.5): field
+/// predicates only — embedding/BM25 are never edge predicates.
+fn matchesEdgeProps(edge: ir.RelationEdge, filter: ?ir.Filter) bool {
+    const f = filter orelse return true;
+    switch (f) {
+        .has_embedding, .bm25 => return false,
+        .and_filter => |terms| {
+            for (terms) |t| {
+                if (!matchesEdgeProps(edge, t)) return false;
+            }
+            return true;
+        },
+        else => return matchesFieldPred(edge.props, f),
+    }
+}
+
+/// `MATCH` — one hop per step over the append-ordered edge list; endpoints
+/// deduped keeping first appearance; score = weight of the first edge that
+/// reached the endpoint (start = 0.0). Rows = the FINAL frontier.
+fn runMatch(store: *EngineStore, gpa: std.mem.Allocator, path: ir.MatchPath) EngineError![]Row {
+    if (store.findIndex(path.start) == null) return try gpa.alloc(Row, 0);
+    var frontier: std.ArrayList(ir.RecordId) = .empty;
+    try frontier.append(gpa, path.start);
+    var scores: std.ArrayList(Scored) = .empty;
+    try scores.append(gpa, .{ .id = path.start, .s = 0.0 });
+
+    for (path.steps) |step| {
+        var next: std.ArrayList(ir.RecordId) = .empty;
+        for (store.edges.items) |edge| {
+            const from_side: ir.RecordId = switch (step.direction) {
+                .out => edge.from,
+                .in => edge.to,
+            };
+            const to_side: ir.RecordId = switch (step.direction) {
+                .out => edge.to,
+                .in => edge.from,
+            };
+            if (!edgeNameMatches(edge.name, step.name)) continue;
+            if (!containsRid(frontier.items, from_side)) continue;
+            if (!matchesEdgeProps(edge, step.edge_props)) continue;
+            if (store.findIndex(to_side) == null) continue; // dangling edge
+            if (!containsRid(next.items, to_side)) try next.append(gpa, to_side);
+            // First edge to reach this endpoint wins its score.
+            var seen = false;
+            for (scores.items) |sc| {
+                if (ir.recordIdEql(sc.id, to_side)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try scores.append(gpa, .{ .id = to_side, .s = edge.weight orelse 0.0 });
+        }
+        frontier = next;
+        if (frontier.items.len == 0) break;
+    }
+
+    var rows: std.ArrayList(Row) = .empty;
+    for (frontier.items) |id| {
+        if (store.findIndex(id)) |i| {
+            try rows.append(gpa, .{ .record = store.records.items[i], .score = scoredGet(scores.items, id) });
+        }
+    }
+    return rows.items;
+}
+
+/// `MATCH ... COUNT` — walk instances (parallel edges each count);
+/// saturating u64 accumulation, missing start = 0, dangling skipped.
+fn runMatchCount(store: *EngineStore, path: ir.MatchPath) u64 {
+    if (store.findIndex(path.start) == null) return 0;
+    var frontier_list: std.ArrayList(Walk) = .empty;
+    frontier_list.append(store.gpa, .{ .id = path.start, .walks = 1 }) catch return 0;
+    for (path.steps) |step| {
+        var next: std.ArrayList(Walk) = .empty;
+        for (store.edges.items) |edge| {
+            const from_side: ir.RecordId = switch (step.direction) {
+                .out => edge.from,
+                .in => edge.to,
+            };
+            const to_side: ir.RecordId = switch (step.direction) {
+                .out => edge.to,
+                .in => edge.from,
+            };
+            if (!edgeNameMatches(edge.name, step.name)) continue;
+            const walks = walkGet(frontier_list.items, from_side) orelse continue;
+            if (!matchesEdgeProps(edge, step.edge_props)) continue;
+            if (store.findIndex(to_side) == null) continue;
+            // Accumulate walks(to) += walks(from), linear (BTree in Rust).
+            var acc: ?usize = null;
+            for (next.items, 0..) |w, idx| {
+                if (ir.recordIdEql(w.id, to_side)) {
+                    acc = idx;
+                    break;
+                }
+            }
+            if (acc) |idx| {
+                next.items[idx].walks = saturatingAdd(next.items[idx].walks, walks);
+            } else {
+                next.append(store.gpa, .{ .id = to_side, .walks = walks }) catch return 0;
+            }
+        }
+        if (next.items.len == 0) return 0;
+        frontier_list = next;
+    }
+    var total: u64 = 0;
+    for (frontier_list.items) |w| total = saturatingAdd(total, w.walks);
+    return total;
+}
+
+/// `CLOSURE` — BFS to fixpoint per step; every reached record once, in
+/// first-visit order, scored by BFS depth (start = 0.0).
+fn runClosure(store: *EngineStore, gpa: std.mem.Allocator, path: ir.MatchPath) EngineError![]Row {
+    if (store.findIndex(path.start) == null) return try gpa.alloc(Row, 0);
+    var visited: std.ArrayList(ir.RecordId) = .empty;
+    try visited.append(gpa, path.start);
+    var depths: std.ArrayList(Scored) = .empty;
+    try depths.append(gpa, .{ .id = path.start, .s = 0.0 });
+    var frontier: std.ArrayList(ir.RecordId) = .empty;
+    try frontier.append(gpa, path.start);
+    var next_depth: u32 = 1;
+
+    for (path.steps) |step| {
+        while (true) {
+            var newly: std.ArrayList(ir.RecordId) = .empty;
+            for (frontier.items) |from| {
+                for (store.edges.items) |edge| {
+                    const from_side: ir.RecordId = switch (step.direction) {
+                        .out => edge.from,
+                        .in => edge.to,
+                    };
+                    const to_side: ir.RecordId = switch (step.direction) {
+                        .out => edge.to,
+                        .in => edge.from,
+                    };
+                    if (!ir.recordIdEql(from_side, from)) continue;
+                    if (!edgeNameMatches(edge.name, step.name)) continue;
+                    if (!matchesEdgeProps(edge, step.edge_props)) continue;
+                    if (store.findIndex(to_side) == null) continue;
+                    if (containsRid(visited.items, to_side)) continue;
+                    try visited.append(gpa, to_side);
+                    try newly.append(gpa, to_side);
+                    try depths.append(gpa, .{ .id = to_side, .s = @floatFromInt(next_depth) });
+                }
+            }
+            if (newly.items.len == 0) break; // fixpoint
+            frontier = newly;
+            next_depth += 1;
+        }
+        // Next step continues from everything visited so far (minus start).
+        frontier = .empty;
+        for (visited.items[1..]) |id| try frontier.append(gpa, id);
+    }
+
+    var rows: std.ArrayList(Row) = .empty;
+    for (visited.items) |id| {
+        if (store.findIndex(id)) |i| {
+            try rows.append(gpa, .{ .record = store.records.items[i], .score = scoredGet(depths.items, id) });
+        }
+    }
+    return rows.items;
 }
 
 // ---------------------------------------------------------------------------

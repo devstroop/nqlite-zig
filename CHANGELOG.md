@@ -9,6 +9,22 @@ are met.
 
 ### Added
 
+- **M4 stdio line server** — `src/server.zig` (nql-server parity: one
+  program per line, multi-result lines + `OK` / single `ERR <Display>`
+  line, cross-line declared-table context with synthetic `CREATE TABLE`
+  prefixes, byte-exact response formatting: `MATCH`/`CLOSURE`/`SELECT`
+  labels, Rust-`{:.4}` scores with **half-to-even tie rounding**
+  (`0.03125` → `0.0312`), Rust-debug strings, `short_value` truncation)
+  + `src/main.zig` `--stdio` loop (1 MiB line buffer, per-line flush) +
+  the engine's graph/temporal surface (MATCH/CLOSURE/`MATCH COUNT`,
+  edge-prop filters, `AS OF` replay, `HistoryPruned`, snapshot install).
+  **Gate: the nqlite-experiments harness with `NQL_SERVER_BIN=<zig>` —
+  E01–E07 + E10: 43/43 `transcript_sha256` byte-identical to the Rust
+  server, all deterministic, zero errors** (the plan's M5 wire-parity
+  bar, hit at M4). Key fix: lines are arena-duped at the boundary —
+  parser tokens borrow the reused stdin buffer, which silently rotted
+  cross-line state until the harness caught it.
+
 - **M3 engine core** — `src/engine.zig` (canonical-order store with
   BTreeMap insert semantics, `execute_plan` with memory contexts, the full
   SELECT pipeline: all field predicates + `id` pseudo-field, exact cosine

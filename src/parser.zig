@@ -110,20 +110,20 @@ const Parser = struct {
     fn expectIdent(self: *Parser, what: []const u8) error{Parse}![]const u8 {
         const s = self.bump();
         if (s.tok == .ident) return s.tok.ident;
-        return self.failAtSpan(s, "expected {s}, found {s}", .{ what, describe(s.tok) });
+        return self.failAtSpan(s, "expected {s}, found {s}", .{ what, describe(self.gpa, s.tok) });
     }
 
     /// Consume a specific keyword, matching case-insensitively.
     fn expectKeyword(self: *Parser, kw: []const u8, what: []const u8) error{Parse}!void {
         const s = self.bump();
         if (s.tok == .ident and eqlKw(s.tok.ident, kw)) return;
-        return self.failAtSpan(s, "expected {s} (`{s}`), found {s}", .{ what, kw, describe(s.tok) });
+        return self.failAtSpan(s, "expected {s} (`{s}`), found {s}", .{ what, kw, describe(self.gpa, s.tok) });
     }
 
     fn expectToken(self: *Parser, tok: lexer.Token, what: []const u8) error{Parse}!void {
         const s = self.bump();
         if (std.meta.activeTag(s.tok) == std.meta.activeTag(tok)) return;
-        return self.failAtSpan(s, "expected {s}, found {s}", .{ what, describe(s.tok) });
+        return self.failAtSpan(s, "expected {s}, found {s}", .{ what, describe(self.gpa, s.tok) });
     }
 
     /// Consume an optional comma separator; true if present.
@@ -169,7 +169,7 @@ const Parser = struct {
         }
         return self.failHere(
             "expected a statement keyword (CREATE, INSERT, RELATE, MATCH, CLOSURE, MEMORY, SELECT, FORGET, PRUNE, HISTORY), found {s}",
-            .{describe(t)},
+            .{describe(self.gpa, t)},
         );
     }
 
@@ -247,7 +247,7 @@ const Parser = struct {
                     weight = switch (value) {
                         .int => |n| @floatFromInt(n),
                         .float => |f| @floatCast(f),
-                        else => return self.failHere("SET weight expects a number, found {s}", .{valueName(value)}),
+                        else => return self.failHere("SET weight expects a number, found {s}", .{valueName(self.gpa, value)}),
                     };
                 } else {
                     props.append(self.gpa, .{ .key = field, .value = value }) catch
@@ -471,7 +471,7 @@ const Parser = struct {
                 // Rust: negative Int tokens become the decimal STRING id.
                 .{ .str = std.fmt.allocPrint(self.gpa, "{d}", .{n}) catch return self.failHere("out of memory", .{}) },
             .ident => |word| .{ .str = word },
-            else => return self.failAtSpan(s, "expected record id (number or name), found {s}", .{describe(s.tok)}),
+            else => return self.failAtSpan(s, "expected record id (number or name), found {s}", .{describe(self.gpa, s.tok)}),
         };
         return .{ .table = table, .id = id };
     }
@@ -637,7 +637,7 @@ const Parser = struct {
         const q = try self.parseValue();
         const query: []const u8 = switch (q) {
             .str => |s| s,
-            else => return self.failHere("::bm25 query must be a string, found {s}", .{valueName(q)}),
+            else => return self.failHere("::bm25 query must be a string, found {s}", .{valueName(self.gpa, q)}),
         };
         try self.expectToken(.r_paren, "`)` closing ::bm25");
         var k: ?usize = null;
@@ -689,7 +689,7 @@ const Parser = struct {
                     self.idx += 1;
                     out.append(self.gpa, @floatCast(f)) catch return self.failHere("out of memory", .{});
                 },
-                else => return self.failHere("expected a number in vector literal, found {s}", .{describe(self.peekTok())}),
+                else => return self.failHere("expected a number in vector literal, found {s}", .{describe(self.gpa, self.peekTok())}),
             }
             if (!self.eatComma()) {
                 try self.expectToken(.r_bracket, "`]` closing vector literal");
@@ -723,7 +723,7 @@ const Parser = struct {
                     entries.append(self.gpa, .{ .key = key, .value = value }) catch
                         return self.failHere("out of memory", .{});
                 },
-                else => return self.failHere("expected object key or `}}`, found {s}", .{describe(self.peekTok())}),
+                else => return self.failHere("expected object key or `}}`, found {s}", .{describe(self.gpa, self.peekTok())}),
             }
             if (!self.eatComma()) {
                 try self.expectToken(.r_brace, "`}` closing record body");
@@ -748,7 +748,7 @@ const Parser = struct {
             },
             .l_brace => return .{ .doc = try self.parseObjectBody() },
             .l_bracket => return self.parseArrayBody(),
-            else => return self.failAtSpan(s, "expected a value, found {s}", .{describe(s.tok)}),
+            else => return self.failAtSpan(s, "expected a value, found {s}", .{describe(self.gpa, s.tok)}),
         }
     }
 
@@ -799,7 +799,7 @@ const Parser = struct {
                 if (n >= 0) return @intCast(n);
                 return self.failAtSpan(s, "{s} must be non-negative, found {d}", .{ what, n });
             },
-            else => return self.failAtSpan(s, "expected a non-negative integer for {s}, found {s}", .{ what, describe(s.tok) }),
+            else => return self.failAtSpan(s, "expected a non-negative integer for {s}, found {s}", .{ what, describe(self.gpa, s.tok) }),
         }
     }
 
@@ -807,7 +807,7 @@ const Parser = struct {
         const s = self.bump();
         switch (s.tok) {
             .int => |n| return n,
-            else => return self.failAtSpan(s, "expected an integer for {s}, found {s}", .{ what, describe(s.tok) }),
+            else => return self.failAtSpan(s, "expected an integer for {s}, found {s}", .{ what, describe(self.gpa, s.tok) }),
         }
     }
 
@@ -822,7 +822,7 @@ const Parser = struct {
             const raw: f64 = switch (s.tok) {
                 .int => |n| @floatFromInt(n),
                 .float => |f| f,
-                else => return self.failAtSpan(s, "expected a number for salience weight {d} of 4 (α, β, γ, δ), found {s}", .{ i + 1, describe(s.tok) }),
+                else => return self.failAtSpan(s, "expected a number for salience weight {d} of 4 (α, β, γ, δ), found {s}", .{ i + 1, describe(self.gpa, s.tok) }),
             };
             const v: f32 = @floatCast(raw);
             if (!std.math.isFinite(v))
@@ -843,12 +843,15 @@ fn tokStrIdent(t: lexer.Token) []const u8 {
     };
 }
 
-fn describe(t: lexer.Token) []const u8 {
+/// Rust `describe(token)` — payload-bearing, for transcript-exact ERR lines:
+/// `identifier \`x\``, `integer \`5\``, `float`, `string`, quoted
+/// punctuation, "end of input".
+fn describe(gpa: std.mem.Allocator, t: lexer.Token) []const u8 {
     return switch (t) {
-        .ident => "identifier",
-        .int => "integer",
-        .float => "float",
-        .str => "string",
+        .ident => |s| std.fmt.allocPrint(gpa, "identifier `{s}`", .{s}) catch "identifier",
+        .int => |n| std.fmt.allocPrint(gpa, "integer `{d}`", .{n}) catch "integer",
+        .float => |f| std.fmt.allocPrint(gpa, "float `{d}`", .{f}) catch "float",
+        .str => |s| std.fmt.allocPrint(gpa, "string `{s}`", .{s}) catch "string",
         .l_paren => "`(`",
         .r_paren => "`)`",
         .l_brace => "`{`",
@@ -873,17 +876,21 @@ fn describe(t: lexer.Token) []const u8 {
     };
 }
 
-fn valueName(v: ir.Value) []const u8 {
+/// Rust `value_name(value)` (payload-bearing, as in the reference).
+fn valueName(gpa: std.mem.Allocator, v: ir.Value) []const u8 {
     return switch (v) {
         .null => "null",
-        .bool => "boolean",
-        .int => "integer",
-        .float => "float",
-        .str => "string",
+        .bool => |b| std.fmt.allocPrint(gpa, "boolean `{}`", .{b}) catch "boolean",
+        .int => |n| std.fmt.allocPrint(gpa, "integer `{d}`", .{n}) catch "integer",
+        .float => |f| std.fmt.allocPrint(gpa, "float `{d}`", .{f}) catch "float",
+        .str => |s| std.fmt.allocPrint(gpa, "string `{s}`", .{s}) catch "string",
         .doc => "object",
         .arr => "array",
         .vector => "vector",
-        .ref => "reference",
+        .ref => |rid| blk: {
+            const disp = ir.recordIdDisplay(gpa, rid) catch break :blk "reference";
+            break :blk std.fmt.allocPrint(gpa, "reference `{s}`", .{disp}) catch "reference";
+        },
     };
 }
 

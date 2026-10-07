@@ -3,32 +3,48 @@ const Io = std.Io;
 
 const nqlite_zig = @import("nqlite_zig");
 
+/// nqlite line-protocol server (`--stdio`): one nql program per line in,
+/// one response out — byte-identical to nql-server's stdio mode.
+///
+/// TODO(M6): `--db <path>` persistence (the E01–E05 harness drives the Rust
+/// CLI for persistence cases; the server is only ever spawned with --stdio).
+/// TODO(M4): TCP mode (default in the reference) — not needed by the harness.
 pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // This is appropriate for anything that lives as long as the process.
     const arena: std.mem.Allocator = init.arena.allocator();
-
-    // Accessing command line arguments:
+    const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+
+    var want_stdio = false;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--stdio")) want_stdio = true;
+    }
+    if (!want_stdio) {
+        std.debug.print("nqlite_zig: only --stdio is implemented so far (M4)\n", .{});
+        return error.UnsupportedMode;
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    var server = nqlite_zig.server.Server.init(arena);
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    // 1 MiB line buffer — corpus programs are far smaller; a longer line is
+    // a protocol violation we refuse rather than silently truncate.
+    var in_buf: [1 << 20]u8 = undefined;
+    var stdin_file_reader = Io.File.stdin().reader(io, &in_buf);
+    const stdin_reader = &stdin_file_reader.interface;
+    var out_buf: [1 << 16]u8 = undefined;
+    var stdout: Io.File.Writer = .init(.stdout(), io, &out_buf);
+    const out = &stdout.interface;
 
-    try nqlite_zig.printAnotherMessage(stdout_writer);
-
-    try stdout_writer.flush(); // Don't forget to flush!
+    while (true) {
+        const raw = stdin_reader.takeDelimiterInclusive('\n') catch |e| switch (e) {
+            error.EndOfStream => break, // EOF (Ctrl-D): clean exit
+            else => return e,
+        };
+        const resp = server.handleLine(raw);
+        try out.writeAll(resp);
+        try out.writeAll("\n");
+        try out.flush(); // one response, flushed per line (reference behavior)
+    }
+    try out.flush();
 }
 
 test "simple test" {
