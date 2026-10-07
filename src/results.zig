@@ -277,6 +277,7 @@ test "engine results match the Rust oracle" {
                 .select => "select",
                 .match_ => "match",
                 .closure => "closure",
+                .history => "history",
             };
             const wkind = wr.object.get("kind").?.string;
             if (!std.mem.eql(u8, wkind, kind)) {

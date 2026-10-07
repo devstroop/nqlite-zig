@@ -184,6 +184,7 @@ fn formatResult(gpa: std.mem.Allocator, res: engine.QueryResult) ![]const u8 {
         .select => |table| try std.fmt.allocPrint(gpa, "SELECT {s}", .{table}),
         .match_ => |path| try fmtPathLabel(gpa, "MATCH", path),
         .closure => |path| try fmtPathLabel(gpa, "CLOSURE", path),
+        .history => |since| try std.fmt.allocPrint(gpa, "HISTORY SINCE {d}", .{since}),
     };
     if (res.rows.len == 0) {
         return std.fmt.allocPrint(gpa, "{s} (0 rows)", .{label});
@@ -471,6 +472,136 @@ test "--db persists and reseeds declared tables" {
         try std.testing.expect(std.mem.indexOf(u8, mout, ": t:2 score=") == null);
         const sout = s.handleLine("SELECT * FROM scratch;");
         try std.testing.expect(std.mem.indexOf(u8, sout, "scratch:1") != null);
+        s.file.?.close();
+    }
+}
+
+test "history surface transcript (M7 golden, byte-exact with the Rust oracle)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const io = std.testing.io;
+    var s = Server.init(gpa, io);
+
+    const pruned6 = "history before ts 6 was compacted (PRUNE HISTORY); AS OF / HISTORY SINCE timestamps earlier than the snapshot are no longer available";
+    const pruned7 = "history before ts 7 was compacted (PRUNE HISTORY); AS OF / HISTORY SINCE timestamps earlier than the snapshot are no longer available";
+    const pruned2 = "history before ts 2 was compacted (PRUNE HISTORY); AS OF / HISTORY SINCE timestamps earlier than the snapshot are no longer available";
+
+    try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE t VECTOR<f32, 2>"));
+    try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE scratch")); // decl-only
+    try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO t:1 { \"a\": 1 }"));
+    try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO t:2 { \"a\": 2 }"));
+    try std.testing.expectEqualStrings("OK", s.handleLine("RELATE (t:1) -> :knows -> (t:2)"));
+    try std.testing.expectEqualStrings("OK", s.handleLine("FORGET t:2")); // clock 6
+
+    // Rotation-equivalence anchor: the unpruned window must answer this
+    // byte-identically after compaction (t >= horizon).
+    const asof6 = "SELECT t (1 rows): t:1 score=0.0000 {a=1}\nOK";
+    try std.testing.expectEqualStrings(asof6, s.handleLine("SELECT * FROM t AS OF 6"));
+
+    // Full delta before pruning: every mutation in append order with its
+    // subject ids — edge-only RELATE included (#118).
+    try std.testing.expectEqualStrings(
+        "HISTORY SINCE 0 (6 rows): history:1 score=1.0000 {dim=2, kind=\"CREATE\", table=\"t\", ts=1}; history:2 score=2.0000 {kind=\"CREATE\", table=\"scratch\", ts=2}; history:3 score=3.0000 {id=\"t:1\", kind=\"INSERT\", ts=3}; history:4 score=4.0000 {id=\"t:2\", kind=\"INSERT\", ts=4}; history:5 score=5.0000 {from=\"t:1\", kind=\"RELATE\", name=\"knows\", to=\"t:2\", ts=5}; history:6 score=6.0000 {id=\"t:2\", kind=\"FORGET\", ts=6}\nOK",
+        s.handleLine("HISTORY SINCE 0"),
+    );
+    // Exclusive cutoff: strictly-after semantics.
+    try std.testing.expectEqualStrings(
+        "HISTORY SINCE 5 (1 rows): history:6 score=6.0000 {id=\"t:2\", kind=\"FORGET\", ts=6}\nOK",
+        s.handleLine("HISTORY SINCE 5"),
+    );
+    // At the last mutation: empty delta, not an error.
+    try std.testing.expectEqualStrings("HISTORY SINCE 6 (0 rows)\nOK", s.handleLine("HISTORY SINCE 6"));
+
+    // ---- Compaction (#95): snapshot at the current clock (6) ----
+    try std.testing.expectEqualStrings("OK", s.handleLine("PRUNE HISTORY"));
+    const err6 = "ERR ";
+    var out = s.handleLine("HISTORY SINCE 0");
+    try std.testing.expectEqualStrings(err6 ++ pruned6, out);
+    out = s.handleLine("SELECT * FROM t AS OF 2");
+    try std.testing.expectEqualStrings(err6 ++ pruned6, out);
+    // From the horizon on: the snapshot is bookkeeping (never a mutation),
+    // and rotation-equivalence holds byte-for-byte.
+    try std.testing.expectEqualStrings("HISTORY SINCE 6 (0 rows)\nOK", s.handleLine("HISTORY SINCE 6"));
+    try std.testing.expectEqualStrings(asof6, s.handleLine("SELECT * FROM t AS OF 6"));
+
+    // Post-prune mutations stream on from the horizon.
+    try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO t:3 { \"a\": 3 }")); // clock 7
+    try std.testing.expectEqualStrings(
+        "HISTORY SINCE 6 (1 rows): history:7 score=7.0000 {id=\"t:3\", kind=\"INSERT\", ts=7}\nOK",
+        s.handleLine("HISTORY SINCE 6"),
+    );
+
+    // Re-prune rebuilds the snapshot in place (no stacking): horizon = 7.
+    try std.testing.expectEqualStrings("OK", s.handleLine("PRUNE HISTORY"));
+    out = s.handleLine("HISTORY SINCE 6");
+    try std.testing.expectEqualStrings(err6 ++ pruned7, out);
+    try std.testing.expectEqualStrings("HISTORY SINCE 7 (0 rows)\nOK", s.handleLine("HISTORY SINCE 7"));
+    try std.testing.expectEqualStrings(
+        "SELECT t (2 rows): t:1 score=0.0000 {a=1}; t:3 score=0.0000 {a=3}\nOK",
+        s.handleLine("SELECT * FROM t;"),
+    );
+
+    // ---- Memory blocks: own clock, own deltas, own horizon (#95) ----
+    try std.testing.expectEqualStrings(
+        "OK",
+        s.handleLine("MEMORY m; CREATE TABLE mt; INSERT INTO mt:1 { \"v\": 1 }"),
+    );
+    try std.testing.expectEqualStrings(
+        "HISTORY SINCE 0 (2 rows): history:1 score=1.0000 {kind=\"CREATE\", table=\"mt\", ts=1}; history:2 score=2.0000 {id=\"mt:1\", kind=\"INSERT\", ts=2}\nOK",
+        s.handleLine("MEMORY m; HISTORY SINCE 0"),
+    );
+    // PRUNE inside the block compacts the block (root untouched).
+    try std.testing.expectEqualStrings("OK", s.handleLine("MEMORY m; PRUNE HISTORY"));
+    out = s.handleLine("MEMORY m; HISTORY SINCE 0");
+    try std.testing.expectEqualStrings(err6 ++ pruned2, out);
+    out = s.handleLine("HISTORY SINCE 0");
+    try std.testing.expectEqualStrings(err6 ++ pruned7, out);
+    // Current reads in the block survive its own compaction.
+    try std.testing.expectEqualStrings(
+        "SELECT mt (1 rows): mt:1 score=0.0000 {v=1}\nOK",
+        s.handleLine("MEMORY m; SELECT * FROM mt;"),
+    );
+}
+
+test "prune history preserves reseed across reopen" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}/store.nql",
+        .{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path },
+    );
+
+    {
+        var s = try Server.open(gpa, io, path);
+        try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE scratch")); // decl-only
+        try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE t"));
+        try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO t:1 { \"n\": 1 }"));
+        try std.testing.expectEqualStrings("OK", s.handleLine("PRUNE HISTORY"));
+        // Live insert into the declaration-only table still works.
+        try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO scratch:1 { \"n\": 2 }"));
+        s.file.?.close();
+    }
+
+    {
+        var s = try Server.open(gpa, io, path);
+        // Re-seeded from the retained declarations in the pruned history.
+        try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO scratch:2 { \"n\": 3 }"));
+        const out = s.handleLine("SELECT * FROM scratch;");
+        try std.testing.expect(std.mem.indexOf(u8, out, "scratch:1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "scratch:2") != null);
+        // Pre-snapshot AS OF errors loudly …
+        const err = s.handleLine("SELECT * FROM t AS OF 1;");
+        try std.testing.expect(std.mem.startsWith(u8, err, "ERR"));
+        try std.testing.expect(std.mem.indexOf(u8, err, "compacted") != null);
+        // … while current reads are unaffected.
+        const now = s.handleLine("SELECT * FROM t;");
+        try std.testing.expect(std.mem.indexOf(u8, now, "t:1") != null);
         s.file.?.close();
     }
 }

@@ -9,6 +9,25 @@ are met.
 
 ### Added
 
+- **M7 temporal retention** — `PRUNE HISTORY` + `HISTORY SINCE` (the two
+  statements still `NotImplemented` since M4): compaction replaces the
+  history with the retained `CREATE TABLE` declarations (original
+  timestamps) plus one `Snapshot` at the current clock — memories
+  depth-first, re-prune rebuilds in place instead of stacking, no clock
+  bump; snapshot payloads carry BTree-ordered `tables`/`vector_dims` for
+  reference-byte fidelity. `HISTORY SINCE` returns one row per mutation
+  strictly after the cutoff (`history:<ts>` ids, `kind` + subject fields:
+  CREATE table/dim, INSERT id, RELATE from/to/name, FORGET tombstone) and
+  respects the loud `HistoryPruned` horizon — now shared with `AS OF`
+  through one `failPruned` helper (message byte-identical to the
+  reference), including **memory blocks** (own clock/deltas/horizon;
+  block errors surface on the root the server renders). New
+  `QueryKind.history` label (`HISTORY SINCE <ts>`). **Gates: the
+  `history_surface_transcript` golden test — same strings as the Rust
+  oracle (nqlite #153) — plus prune-reseed-across-reopen; harness exp11
+  (new, the first experiment to issue these statements) = 4/4 digests
+  byte-identical to Rust, full parity run 53/53.**
+
 - **M6 persistence** — `src/storage.zig`: single-writer `--db` stores as
   format-v4 files (`v4.encode`/`v4.decode`, spec/file-format.md §5) with a
   CRC32-framed WAL (`crc32 || len_le || payload`, torn-tail truncation on
