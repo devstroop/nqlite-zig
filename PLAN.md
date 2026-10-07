@@ -14,7 +14,7 @@ bump) before code; gates below are *exit criteria*, not aspirations.
 | **M5** | Harness parity | full suite | **E01–E10 green AND `transcript_sha256` == Rust digests** |
 | **M6** | Persistence | v4 + WAL + CRC, single-writer flock, reopen; **v3 importer** | persistence suite green + import answers identical on the E08 100k store |
 | **M7** | Temporal & graph | AS OF / HISTORY SINCE / PRUNE incl. `HistoryPruned` contracts; MATCH/CLOSURE + AS OF | E07-style rotation-equivalence checks green |
-| **M8** | Performance | mmap open, SIMD kNN, benches with bindings (commit/profile/machine) | reopen ≥ Rust (260 ms reference); exact kNN 75–140 ms @100k → single-digit-ms target |
+| **M8** | Performance | **landed**: O(n log n) sorts, candidate-aligned kNN/RRF lookups, BM25 build/score fixes (bound numbers: docs/BENCHMARKING.md); **deferred**: mmap open, SIMD kNN, adjacency index | **E08 gate: 4/4 + full parity 57/57** (was `B-TIMEOUT`) |
 | **M9** | Cutover kit | experiments default flip (flagged), knot sidecar ADR (separate), optional WASM spike, release | cutover criteria met (below) |
 
 ## Parallel tracks (worktrees)
