@@ -17,6 +17,8 @@ pub const analyzer = @import("analyzer.zig");
 // M3: the deterministic in-memory engine.
 pub const engine = @import("engine.zig");
 pub const bm25 = @import("bm25.zig");
+// M4: the line-protocol server (nql-server parity).
+pub const server = @import("server.zig");
 
 // Run every imported file's tests (zig runs tests of files reachable from
 // the root module).
@@ -33,6 +35,7 @@ test {
     _ = @import("engine.zig");
     _ = @import("bm25.zig");
     _ = @import("results.zig");
+    _ = @import("server.zig");
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
