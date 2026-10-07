@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install zig (pinned by .zigversion)
+        run: |
+          V=$(cat .zigversion)
+          curl -sSfL "https://ziglang.org/download/${V}/zig-x86_64-linux-${V}.tar.xz" \
+            | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-${V}" >> "$GITHUB_PATH"
+          /opt/zig-x86_64-linux-${V}/zig version
+
+      - name: toolchain matches pin
+        run: |
+          test "$(zig version)" = "$(cat .zigversion)" || {
+            echo "zig $(zig version) != pin $(cat .zigversion)"; exit 1; }
+
+      - name: zig fmt
+        run: zig fmt --check .
+
+      - name: build
+        run: zig build
+
+      - name: test
+        run: zig build test
+
+      # The spec is owned by devstroop/nqlite; this repo vendors a pinned
+      # copy. A drift here means the pin (or the mirror) must move — in a
+      # deliberate PR, never silently.
+      - name: spec sync (pinned nqlite)
+        run: bash scripts/check-spec-sync.sh
