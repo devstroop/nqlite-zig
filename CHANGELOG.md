@@ -9,6 +9,19 @@ are met.
 
 ### Added
 
+- **M2 NQL parser** — `src/lexer.zig` (tokens, spans, comments, escapes,
+  number/string literals — 1-based byte columns, the reference's
+  post-bump error positions), `src/parser.zig` (full spec §1 grammar:
+  all statements, WHERE conjunctions + kNN/BM25/hybrid, ORDER keys with
+  field-DESC rules, MATCH/CLOSURE paths with edge props, JSON-ish values
+  with all-numeric→vector collapse, canonical doc bodies), and
+  `src/analyzer.zig` (declaration context, embedding-dim contract, kNN
+  enrichment). Gate: **`spec/fixtures/nql/corpus.json` — 77 cases
+  bit-for-bit** (statement hex via the M1 codec, error kind+line:col,
+  analyzer variants, enriched `analyzed_hex`) + lexer-trap tests
+  (digit-first ids, bare `-` at the exact column, escapes). Spec pin
+  `b8e82fd`.
+
 - **M1 values + format-v4 codec** — `src/ir.zig` (Value/RecordId/Record/
   RelationEdge/Statement/Store mirrors of `nql_ir`, incl. the two store
   flavours: section stores carry `tables`, statement-embedded stores don't

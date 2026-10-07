@@ -10,6 +10,10 @@ pub const ir = @import("ir.zig");
 pub const payload = @import("payload.zig");
 pub const v4 = @import("v4.zig");
 pub const crc32 = @import("crc32.zig");
+// M2: the NQL front-end (lexer → parser → analyzer).
+pub const lexer = @import("lexer.zig");
+pub const parser = @import("parser.zig");
+pub const analyzer = @import("analyzer.zig");
 
 // Run every imported file's tests (zig runs tests of files reachable from
 // the root module).
@@ -19,6 +23,10 @@ test {
     _ = @import("v4.zig");
     _ = @import("crc32.zig");
     _ = @import("fixtures.zig");
+    _ = @import("lexer.zig");
+    _ = @import("parser.zig");
+    _ = @import("analyzer.zig");
+    _ = @import("corpus.zig");
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
