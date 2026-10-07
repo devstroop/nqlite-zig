@@ -9,6 +9,19 @@ are met.
 
 ### Added
 
+- **M1 values + format-v4 codec** — `src/ir.zig` (Value/RecordId/Record/
+  RelationEdge/Statement/Store mirrors of `nql_ir`, incl. the two store
+  flavours: section stores carry `tables`, statement-embedded stores don't
+  — `serde(skip)` wire truth), `src/payload.zig` (§5.7: uleb128, zigzag,
+  f32/f64 bit-exact, all 13 Statement tags), `src/v4.zig` (§5.1–§5.6
+  container: writer with canonical packing + loud reader — magic/version/
+  flags/alignment/CRC32/required-sections/`Truncated`-class errors, never
+  a partial load), `src/crc32.zig` (IEEE, `crc32fast`-compatible). Gate:
+  **golden-fixture round-trip byte-exact** against `spec/fixtures/v4/`
+  (empty/plain/rich/pruned), `manifest.json` section tables, and
+  `statements.json` hex+JSON oracles — plus the corruption suite and
+  canonical `RecordId` ordering tests. Spec pin `68c6417`.
+
 - **M0 bootstrap** — repository scaffold on **Zig 0.17.0** (pinned in
   `.zigversion` + `minimum_zig_version`; CI enforces the match): package
   module `nqlite_zig`, starter executable, test wiring (`zig build` /

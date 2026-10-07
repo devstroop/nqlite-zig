@@ -1,6 +1,25 @@
 //! By convention, root.zig is the root source file when making a package.
+//!
+//! M1 (format v4, spec/file-format.md §5): the format-v4 codec — IR types,
+//! §5.7 payload encoding, §5.1–§5.6 container, and the golden-fixture gate
+//! (`spec/fixtures/v4/`, the byte oracle vendored from devstroop/nqlite).
 const std = @import("std");
 const Io = std.Io;
+
+pub const ir = @import("ir.zig");
+pub const payload = @import("payload.zig");
+pub const v4 = @import("v4.zig");
+pub const crc32 = @import("crc32.zig");
+
+// Run every imported file's tests (zig runs tests of files reachable from
+// the root module).
+test {
+    _ = @import("ir.zig");
+    _ = @import("payload.zig");
+    _ = @import("v4.zig");
+    _ = @import("crc32.zig");
+    _ = @import("fixtures.zig");
+}
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
 ///
