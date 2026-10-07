@@ -6,24 +6,43 @@ const nqlite_zig = @import("nqlite_zig");
 /// nqlite line-protocol server (`--stdio`): one nql program per line in,
 /// one response out — byte-identical to nql-server's stdio mode.
 ///
-/// TODO(M6): `--db <path>` persistence (the E01–E05 harness drives the Rust
-/// CLI for persistence cases; the server is only ever spawned with --stdio).
-/// TODO(M4): TCP mode (default in the reference) — not needed by the harness.
+/// `--db <path>` (or `-d`) serves a persistent single-file store: lock,
+/// v4 load + WAL replay on open; per-plan WAL frames (+ #109 ContextReset)
+/// and threshold checkpoints while running. TCP mode (the reference's
+/// default) is not implemented yet.
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
 
     var want_stdio = false;
-    for (args) |a| {
+    var db_path: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
         if (std.mem.eql(u8, a, "--stdio")) want_stdio = true;
+        if (std.mem.eql(u8, a, "--db") or std.mem.eql(u8, a, "-d")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: --db needs a path\n", .{});
+                std.process.exit(1);
+            }
+            db_path = args[i];
+        }
     }
     if (!want_stdio) {
         std.debug.print("nqlite_zig: only --stdio is implemented so far (M4)\n", .{});
         return error.UnsupportedMode;
     }
 
-    var server = nqlite_zig.server.Server.init(arena);
+    var server = if (db_path) |p|
+        nqlite_zig.server.Server.open(arena, io, p) catch |e| {
+            // Same `error: …` + exit 1 convention as nql-server (issue #84).
+            std.debug.print("error: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        }
+    else
+        nqlite_zig.server.Server.init(arena, io);
 
     // 1 MiB line buffer — corpus programs are far smaller; a longer line is
     // a protocol violation we refuse rather than silently truncate.

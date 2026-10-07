@@ -351,7 +351,9 @@ pub fn executePlan(store: *EngineStore, plan: []const ir.Statement) EngineError!
     return results.items;
 }
 
-fn executeInContext(
+/// Execute a single `Statement` within a plan's memory context.
+/// (Public for WAL replay — spec §2 / issue #109.)
+pub fn executeInContext(
     store: *EngineStore,
     stmt: ir.Statement,
     current_memory: *?[]const u8,
@@ -500,6 +502,50 @@ fn rebuildTables(store: *EngineStore) EngineError!void {
         }
     }
     for (store.memories.items) |*m| try rebuildTables(&m.store);
+}
+
+/// Build engine state from a decoded §5 store (file-load path).
+pub fn fromIr(gpa: std.mem.Allocator, s: ir.Store) EngineError!EngineStore {
+    var out = EngineStore.init(gpa);
+    for (s.records) |r| try out.insert(r);
+    for (s.edges) |e| try out.edges.append(gpa, e);
+    for (s.tables) |t| try out.tables.append(gpa, t);
+    out.clock = s.clock;
+    for (s.history) |h| try out.history.append(gpa, h);
+    for (s.memories) |m| {
+        try out.memories.append(gpa, .{ .name = m.name, .store = try fromIr(gpa, m.store) });
+    }
+    return out;
+}
+
+/// Borrowed view of engine state as the §5 store (checkpoint encoding).
+/// The slices borrow `self` — encode immediately; `memories` needs the
+/// arena for the recursive struct array.
+pub fn toIr(self: *EngineStore, gpa: std.mem.Allocator) EngineError!ir.Store {
+    const mems = try gpa.alloc(ir.Memory, self.memories.items.len);
+    for (mems, 0..) |*slot, i| {
+        slot.* = .{
+            .name = self.memories.items[i].name,
+            .store = try toIr(&self.memories.items[i].store, gpa),
+        };
+    }
+    return .{
+        .tables = self.tables.items,
+        .records = self.records.items,
+        .edges = self.edges.items,
+        .clock = self.clock,
+        .history = self.history.items,
+        .memories = mems,
+    };
+}
+
+/// The reference's `is_mutating` (lib.rs): read-only statements are never
+/// WAL-logged; `Memory` and `PruneHistory` are (they change replay state).
+pub fn isMutating(stmt: ir.Statement) bool {
+    return switch (stmt) {
+        .select, .match_path, .match_count, .closure, .history_since, .snapshot, .context_reset => false,
+        .create_table, .insert, .relate, .forget, .memory, .prune_history => true,
+    };
 }
 
 fn validateEmbedding(store: *EngineStore, rec: ir.Record) EngineError!void {

@@ -12,15 +12,36 @@ const ir = @import("ir.zig");
 const parser = @import("parser.zig");
 const analyzer = @import("analyzer.zig");
 const engine = @import("engine.zig");
+const storage = @import("storage.zig");
+const v4 = @import("v4.zig");
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     store: engine.EngineStore,
     /// Tables declared so far — byte-sorted (the reference's BTree map).
     declared: std.ArrayList(ir.TableEntry) = .empty,
+    /// Present in `--db` mode: WAL + checkpoints + the single-writer lock.
+    file: ?storage.StoreFile = null,
 
-    pub fn init(gpa: std.mem.Allocator) Server {
-        return .{ .gpa = gpa, .store = engine.EngineStore.init(gpa) };
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) Server {
+        return .{ .gpa = gpa, .io = io, .store = engine.EngineStore.init(gpa) };
+    }
+
+    /// Open a persistent session (`--db <path>`): lock, load the v4 main
+    /// file (if any), replay the WAL, and re-seed the analyzer's cross-line
+    /// table context from the store's catalogs (root + memories — the
+    /// reference's `seed_declared`, issue #89).
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) storage.Error!Server {
+        const sf = try storage.StoreFile.open(path, gpa, io);
+        var self = Server.init(gpa, io);
+        self.file = sf;
+        if (try self.file.?.loadMain()) |ir_store| {
+            self.store = engine.fromIr(gpa, ir_store) catch return error.OutOfMemory;
+        }
+        try self.file.?.replayWal(&self.store);
+        seedDeclared(&self);
+        return self;
     }
 
     /// Handle one protocol line; never panics on bad input.
@@ -77,7 +98,26 @@ pub const Server = struct {
         };
 
         // Record declarations only after success (a failed line never poisons
-        // cross-line analysis).
+        // cross-line analysis) — and, in `--db` mode, log the plan to the WAL
+        // first (the reference's order: WAL frames, then #109's ContextReset
+        // marker, then a threshold checkpoint).
+        if (self.file) |*sf| {
+            var logged = false;
+            for (plan) |stmt| {
+                if (engine.isMutating(stmt)) {
+                    sf.append(stmt) catch return "ERR wal append failed";
+                    logged = true;
+                }
+            }
+            if (logged) {
+                sf.append(.{ .context_reset = {} }) catch return "ERR wal append failed";
+                if (sf.needsCheckpoint()) {
+                    const ir_store = engine.toIr(&self.store, gpa) catch return "ERR checkpoint failed";
+                    const bytes = v4.encode(ir_store, gpa) catch return "ERR checkpoint encode failed";
+                    sf.checkpoint(bytes) catch return "ERR checkpoint failed";
+                }
+            }
+        }
         for (plan) |stmt| {
             switch (stmt) {
                 .create_table => |c| self.upsertDeclared(c.table, c.vector_dim),
@@ -121,6 +161,18 @@ fn planHasCreate(plan: []const ir.Statement, table: []const u8) bool {
         }
     }
     return false;
+}
+
+/// Re-seed the analyzer's cross-line context from a loaded store (root
+/// catalogs plus every memory block's — issue #89). Names borrow the load
+/// arena, which lives as long as the server.
+fn seedDeclared(self: *Server) void {
+    seedFrom(self, &self.store);
+}
+
+fn seedFrom(self: *Server, store: *const engine.EngineStore) void {
+    for (store.tables.items) |t| self.upsertDeclared(t.name, t.vector_dim);
+    for (store.memories.items) |m| seedFrom(self, &m.store);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +335,7 @@ test "server session across lines" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var s = Server.init(gpa);
+    var s = Server.init(gpa, std.testing.io);
     try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE t VECTOR<f32, 2>"));
     try std.testing.expectEqualStrings(
         "OK",
@@ -304,7 +356,7 @@ test "server error responses are single-line and exact" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var s = Server.init(gpa);
+    var s = Server.init(gpa, std.testing.io);
     // Parse error: Rust Display `parse error at L:C: msg`.
     const err = s.handleLine("THIS IS NOT NQL");
     try std.testing.expect(std.mem.startsWith(u8, err, "ERR parse error at "));
@@ -346,7 +398,7 @@ test "match label formatting" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
-    var s = Server.init(gpa);
+    var s = Server.init(gpa, std.testing.io);
     try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE a"));
     try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE b"));
     try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO a:1 {}"));
@@ -359,4 +411,66 @@ test "match label formatting" {
         "MATCH a:1 ->:goes (1 rows): b:2 score=0.0000 {}\nOK",
         out,
     );
+}
+
+test "--db persists and reseeds declared tables" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}/store.nql",
+        .{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path },
+    );
+
+    {
+        var s = try Server.open(gpa, io, path);
+        try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE t VECTOR<f32, 2>"));
+        try std.testing.expectEqualStrings(
+            "OK",
+            s.handleLine("INSERT INTO t:1 { \"text\": \"x\" } EMBED [0.5, 0.5];"),
+        );
+        // Declaration-only table (exists only in history — the #89 trap).
+        try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE scratch;"));
+        // Memory-scoped table.
+        try std.testing.expectEqualStrings("OK", s.handleLine("MEMORY m; CREATE TABLE mt;"));
+        try std.testing.expectEqualStrings(
+            "OK",
+            s.handleLine("MEMORY m; INSERT INTO mt:1 { \"v\": 1 };"),
+        );
+        s.file.?.close();
+    } // drop: WAL persisted, lock released
+
+    {
+        var s = try Server.open(gpa, io, path);
+        // Data survived (WAL replay on open).
+        const out = s.handleLine("SELECT * FROM t;");
+        try std.testing.expect(std.mem.indexOf(u8, out, "t:1") != null);
+        // Pre-restart tables are analyzable again…
+        try std.testing.expectEqualStrings(
+            "OK",
+            s.handleLine("INSERT INTO t:2 { \"text\": \"y\" } EMBED [0.5, 0.5];"),
+        );
+        // …including the empty, dimension-less one…
+        try std.testing.expectEqualStrings(
+            "OK",
+            s.handleLine("INSERT INTO scratch:1 { \"n\": 1 };"),
+        );
+        // …and the memory-scoped one.
+        try std.testing.expectEqualStrings(
+            "OK",
+            s.handleLine("MEMORY m; INSERT INTO mt:2 { \"v\": 2 };"),
+        );
+        const mout = s.handleLine("MEMORY m; SELECT * FROM mt;");
+        try std.testing.expect(std.mem.indexOf(u8, mout, "mt:1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, mout, "mt:2") != null);
+        // Row-shaped leak check: root t:2 must not appear in the memory.
+        try std.testing.expect(std.mem.indexOf(u8, mout, ": t:2 score=") == null);
+        const sout = s.handleLine("SELECT * FROM scratch;");
+        try std.testing.expect(std.mem.indexOf(u8, sout, "scratch:1") != null);
+        s.file.?.close();
+    }
 }

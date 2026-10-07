@@ -9,6 +9,24 @@ are met.
 
 ### Added
 
+- **M6 persistence** — `src/storage.zig`: single-writer `--db` stores as
+  format-v4 files (`v4.encode`/`v4.decode`, spec/file-format.md §5) with a
+  CRC32-framed WAL (`crc32 || len_le || payload`, torn-tail truncation on
+  replay), checkpoint-to-main every 1 MiB (atomic rename; directory fsync
+  still TODO), and `flock(LOCK_EX|LOCK_NB)` single-writer locking
+  (concurrent open → `error: Locked`, exit 1 — nqlite #109). Server
+  wiring: `--stdio --db PATH` opens/replays/seeds declared tables +
+  memory blocks from persisted history (`seed_declared` parity with
+  nqlite #111), appends mutating statements to the WAL (context resets
+  stay in-memory), and checkpoints past the threshold; `main.zig` gains
+  `--db`/`-d`. Engine seams: `fromIr`/`toIr` store converters,
+  `executeInContext` (WAL replay), `isMutating` (WAL hook predicate).
+  **Gate: 32/32 tests (4 storage tests incl. single-writer lock and
+  #109 context replay + a full `--db` restart/reseed session); E2E smoke:
+  same lifecycle transcript byte-identical to `nql-server --stdio --db`,
+  concurrent open locked.** Ported from nqlite #152 (`nql-migrate` /
+  `nqlite::v4`).
+
 - **M4 stdio line server** — `src/server.zig` (nql-server parity: one
   program per line, multi-result lines + `OK` / single `ERR <Display>`
   line, cross-line declared-table context with synthetic `CREATE TABLE`
