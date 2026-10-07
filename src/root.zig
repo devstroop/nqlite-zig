@@ -18,6 +18,7 @@ pub const analyzer = @import("analyzer.zig");
 pub const engine = @import("engine.zig");
 pub const bm25 = @import("bm25.zig");
 // M4: the line-protocol server (nql-server parity).
+pub const storage = @import("storage.zig");
 pub const server = @import("server.zig");
 
 // Run every imported file's tests (zig runs tests of files reachable from
