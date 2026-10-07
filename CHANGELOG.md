@@ -9,6 +9,18 @@ are met.
 
 ### Added
 
+- **M3 engine core** — `src/engine.zig` (canonical-order store with
+  BTreeMap insert semantics, `execute_plan` with memory contexts, the full
+  SELECT pipeline: all field predicates + `id` pseudo-field, exact cosine
+  kNN with id tie-breaks, BM25/hybrid-RRF score dominance, `cmp_total`
+  ordering incl. exact int/float rules, every ORDER BY — field/`::recency`/
+  `::score` Laplace votes/`::votes`/`::feedback` decay/`::salience`
+  blends — `COUNT(*)`, `OFFSET`/`LIMIT`/k-caps, projection, typo guard),
+  `src/bm25.zig` (Okapi BM25, f32-exact, bit-identical `@log` vs Rust
+  `f32::ln`), and `src/results.zig`: **the M3 gate — 36 golden cases
+  against `spec/fixtures/engine/results.json`** (`rows_hex` bit-for-bit
+  + structural row JSON + error variants). Spec pin `bafa7e0`.
+
 - **M2 NQL parser** — `src/lexer.zig` (tokens, spans, comments, escapes,
   number/string literals — 1-based byte columns, the reference's
   post-bump error positions), `src/parser.zig` (full spec §1 grammar:
