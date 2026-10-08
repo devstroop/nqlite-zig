@@ -9,6 +9,15 @@ are met.
 
 ### Added
 
+- **M9 kit — flagged default (`NQL_IMPL=zig`)** — the harness now
+  selects the zig server as its default behind an opt-in flag
+  (precedence: explicit `NQL_SERVER_BIN` > `NQL_IMPL=zig` > Rust;
+  auto-builds ReleaseFast when missing). Demo: all 11 experiments
+  green (failures 0, deterministic) with the flag ON; report binding
+  now records the RESOLVED selection (`mixed` = zig server + Rust
+  CLI/MCP — the flag is server-only, since `nqlite_zig` is
+  `--stdio`-only). The unset-default flip happens at release.
+
 - **ADR-002 — knot seam decided (cutover criterion ✓)** — knot keeps its
   **in-process Rust `nql`/`nqlite` linkage** for v1/v1.x (git deps,
   `Database::open`/`execute`, error-type contract asserted by its own
