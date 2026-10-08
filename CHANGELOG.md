@@ -52,6 +52,17 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
   win is reclaimability (clean file-backed vs pinned anonymous arena).
   Byte-identity: fixtures + reopen suite + exp01–exp11 =57/57 +
   tcp_probe IDENTICAL.
+- **Ingest O(n²) removed — deferred insert queue (worst case ≈77×)** —
+  `EngineStore.pending`: O(1) seq-tagged pushes (any id order), sorted
+  + merged once per write burst at every reader seam (executeStatement
+  reader arm / `toIr` / WAL-replay end / `replayAsOf` / `dumpStore`),
+  deterministic last-write-wins, pure-append fast path. `bench-ingest`
+  @100k: reverse ids **19.19s → ~0.25s**, lex1.77s → ~0.28s, insert
+  flat ~1 µs/row for ALL orders (was191.9 µs/row worst); flush =
+  ~60–230 ms once per burst (noise-bound on this box). A first-draft
+  per-insert pending scan re-introduced the quadratic (14.8 s — why
+  dedup lives at flush, keyed by seq). Gates: suite (incl. upsert-LWW /
+  forget / replay / AS OF) + **exp01–exp11 =57/57** + tcp IDENTICAL.
 
 - **Harness default flip — zig runs all three legs out of the box** —
   `NQL_IMPL` now *opts out* (`=rust`) instead of opting in; unset (or

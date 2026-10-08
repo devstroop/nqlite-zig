@@ -191,6 +191,8 @@ pub const Session = struct {
     /// records canonical, edges append order).
     pub fn dumpStore(self: *Session) !void {
         const st = &self.store;
+        // Direct reader (bypasses executeStatement) — flush queued inserts.
+        try st.flushDeep();
         try self.writeLine("tables:");
         var dimmed: std.ArrayList(ir.TableEntry) = .empty;
         for (st.tables.items) |t| {

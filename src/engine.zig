@@ -61,9 +61,22 @@ const Scored = struct { id: ir.RecordId, s: f32 };
 // Store (mutable engine state; canonical record order by construction)
 // ---------------------------------------------------------------------------
 
+/// A queued insert: the record + its push sequence (deterministic LWW
+/// tie-break for equal ids inside `pending`).
+const PendingRec = struct { seq: u64, rec: ir.Record };
+
 pub const EngineStore = struct {
     gpa: std.mem.Allocator,
     records: std.ArrayList(ir.Record) = .empty, // sorted by RecordId
+    /// Queued inserts awaiting a reader/serializer seam (`flushPending`):
+    /// O(1) push regardless of id order — the sorted invariant is restored
+    /// once per write burst before any consumer reads `records`, turning
+    /// the sorted-insert memmove from O(N²) worst-case (reverse ids:19.2s
+    /// @100k, bench-ingest) into one sort+merge (≈110ms @100k). `seq`
+    /// makes the queue order-preserving: equal ids resolve to the LAST
+    /// push (BTreeMap last-write-wins) — deterministic (M8 discipline).
+    pending: std.ArrayList(PendingRec) = .empty,
+    pending_seq: u64 = 0,
     edges: std.ArrayList(ir.RelationEdge) = .empty, // append order
     tables: std.ArrayList(ir.TableEntry) = .empty, // name -> dim (upserted)
     clock: i64 = 0,
@@ -122,6 +135,113 @@ pub const EngineStore = struct {
             if (ir.RecordId.less(self.records.items[mid].id, rec.id)) lo = mid + 1 else hi = mid;
         }
         try self.records.insert(self.gpa, lo, rec);
+    }
+
+    /// Queued insert (post-stamp): O(1) push — NO scans (a per-insert
+    /// pending scan made every insert O(P) and re-introduced quadratic
+    /// cost — measured14.8s @100k before this redesign). Duplicate ids
+    /// coexist in the queue and resolve at flush: sorted by (id, seq),
+    /// the LAST push wins (BTreeMap LWW); vs base records the queued copy
+    /// always wins (it is newer). Bumps `mut_version` (BM25-cache rule).
+    fn queueInsert(self: *EngineStore, rec: ir.Record) EngineError!void {
+        self.mut_version +%= 1;
+        const seq = self.pending_seq;
+        self.pending_seq +%= 1;
+        try self.pending.append(self.gpa, .{ .seq = seq, .rec = rec });
+    }
+
+    /// Restore the sorted invariant: sort the queue by (id, seq), drop
+    /// same-id run-earlier entries (seq order = push order ⇒ the LAST
+    /// push survives — deterministic), then two-pointer merge with base
+    /// (equal ids take the queued — newer — copy). One allocation,
+    /// O((N+P) log P + P); idempotent no-op when empty (the reader guard
+    /// runs it constantly — the empty check is the whole cost).
+    pub fn flushPending(self: *EngineStore) EngineError!void {
+        if (self.pending.items.len == 0) return;
+        const pend_all = self.pending.items;
+
+        // Fast path: strictly-increasing queue, all above the base tail —
+        // a pure append burst (time-ordered loads): no sort/merge needed.
+        var pure_append = true;
+        if (self.records.items.len > 0) {
+            const last_id = self.records.items[self.records.items.len - 1].id;
+            if (!ir.RecordId.less(last_id, pend_all[0].rec.id)) pure_append = false;
+        }
+        if (pure_append) {
+            for (pend_all, 1..) |p, k| {
+                if (!ir.RecordId.less(pend_all[k - 1].rec.id, p.rec.id)) {
+                    pure_append = false;
+                    break;
+                }
+            }
+        }
+        if (pure_append) {
+            try self.records.ensureTotalCapacity(self.gpa, self.records.items.len + pend_all.len);
+            for (pend_all) |p| try self.records.append(self.gpa, p.rec);
+            self.pending.clearRetainingCapacity();
+            return;
+        }
+
+        std.sort.heap(PendingRec, pend_all, {}, lessPending);
+        // Dedup same ids (keep the last = highest seq, already adjacent).
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < pend_all.len) {
+            var j = i + 1;
+            while (j < pend_all.len and ir.recordIdEql(pend_all[j].rec.id, pend_all[i].rec.id)) {
+                j += 1;
+            }
+            pend_all[w] = pend_all[j - 1]; // last of the run wins
+            w += 1;
+            i = j;
+        }
+        const pend = pend_all[0..w];
+        const base = self.records.items;
+        var out: std.ArrayList(ir.Record) = .empty;
+        defer out.deinit(self.gpa);
+        try out.ensureTotalCapacity(self.gpa, base.len + pend.len);
+        var bi: usize = 0;
+        var pj: usize = 0;
+        while (bi < base.len and pj < pend.len) {
+            switch (cmpRecordId(base[bi].id, pend[pj].rec.id)) {
+                .lt => {
+                    try out.append(self.gpa, base[bi]);
+                    bi += 1;
+                },
+                .gt => {
+                    try out.append(self.gpa, pend[pj].rec);
+                    pj += 1;
+                },
+                .eq => {
+                    try out.append(self.gpa, pend[pj].rec); // LWW: queued wins
+                    bi += 1;
+                    pj += 1;
+                },
+            }
+        }
+        if (bi < base.len) try out.appendSlice(self.gpa, base[bi..]);
+        while (pj < pend.len) : (pj += 1) {
+            try out.append(self.gpa, pend[pj].rec);
+        }
+        self.records.clearRetainingCapacity();
+        try self.records.ensureTotalCapacity(self.gpa, out.items.len);
+        try self.records.appendSlice(self.gpa, out.items);
+        self.pending.clearRetainingCapacity();
+    }
+
+    /// Flush self + every MEMORY sub-store — readers may touch any of them
+    /// (snapshot/prune walk all stores; context routing swaps the active one).
+    pub fn flushDeep(self: *EngineStore) EngineError!void {
+        try self.flushPending();
+        for (self.memories.items) |*m| try m.store.flushDeep();
+    }
+
+    /// (id, seq) total order — seq = push order, so equal ids sort into
+    /// push order and the last push survives dedup (deterministic LWW).
+    fn lessPending(_: void, a: PendingRec, b: PendingRec) bool {
+        const c = cmpRecordId(a.rec.id, b.rec.id);
+        if (c != .lt and c != .gt) return a.seq < b.seq;
+        return c == .lt;
     }
 
     pub fn remove(self: *EngineStore, id: ir.RecordId) void {
@@ -399,6 +519,22 @@ pub fn executeInContext(
 }
 
 fn executeStatement(store: *EngineStore, stmt: ir.Statement) EngineError!?QueryResult {
+    // Reader/serializer seam: queued inserts must be visible before any
+    // read, compact, snapshot, or forget — every context (root and MEMORY
+    // sub-stores) dispatches reads through here, so one guard covers all
+    // of them (plus `toIr` for the checkpoint/encode paths).
+    switch (stmt) {
+        .select,
+        .match_path,
+        .closure,
+        .match_count,
+        .history_since,
+        .snapshot,
+        .prune_history,
+        .forget,
+        => try store.flushDeep(),
+        else => {},
+    }
     switch (stmt) {
         .memory => |m| {
             const msg = std.fmt.allocPrint(
@@ -419,7 +555,7 @@ fn executeStatement(store: *EngineStore, stmt: ir.Statement) EngineError!?QueryR
             try validateEmbedding(store, rec);
             var stamped = rec;
             if (stamped.created_at == 0) stamped.created_at = store.clock + 1;
-            try store.insert(stamped);
+            try store.queueInsert(stamped); // sorted later — flush at reader seams
             try store.logMutation(stmt);
             return null;
         },
@@ -551,6 +687,10 @@ pub fn fromIr(gpa: std.mem.Allocator, s: ir.Store) EngineError!EngineStore {
 /// The slices borrow `self` — encode immediately; `memories` needs the
 /// arena for the recursive struct array.
 pub fn toIr(self: *EngineStore, gpa: std.mem.Allocator) EngineError!ir.Store {
+    // Serializer seam: every checkpoint/encode path funnels through here
+    // (server WAL duties, cli `:flush`, storage replay/migrate) — queued
+    // inserts must land before we snapshot `records`.
+    try self.flushDeep();
     const mems = try gpa.alloc(ir.Memory, self.memories.items.len);
     for (mems, 0..) |*slot, i| {
         slot.* = .{
@@ -930,6 +1070,10 @@ fn replayAsOf(gpa: std.mem.Allocator, src: *const EngineStore, cutoff: i64) Engi
         if (h.ts > cutoff) break;
         _ = try executeStatement(&view, h.stmt);
     }
+    // The replay queued inserts; the view's readers bypass
+    // `executeStatement`, so flush here (sort+merge once — strictly
+    // better than the old per-statement eager inserts).
+    try view.flushPending();
     return view;
 }
 

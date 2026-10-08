@@ -85,8 +85,9 @@ All three query regressions were **quadratic** (×5 rows → ×19 time):
   whole-file read-only mapping directly (read path kept as fallback).
 - ~~BM25 index rebuilt per query~~ — **fixed in M8+** (version-keyed
   cache); see below.
-- **Ingest** uses sorted-insert memmove (O(n²) worst case) — flat
-  enough through 100k (13k TPS) but will bend at bigger stores.
+- ~~Ingest sorted-insert memmove (O(n²) worst case)~~ — **done:
+  deferred insert queue (below)** — reverse-id worst case19.2s →
+  ~0.25s @100k.
 - **MATCH/CLOSURE adjacency index** — edge scans are linear per step;
   not on exp08's path, deferred with the experiment suites still green.
 
@@ -241,6 +242,38 @@ and pinned for the process lifetime.
 Byte proof: fixtures + reopen/lazy-history suite + **exp01–exp11 =
 57/57** + `tcp_probe` IDENTICAL (the mapping feeds the same
 `v4.decodeCore`).
+
+## Ingest results (2026-10-08) — deferred insert queue (the O(n²) item)
+
+**Measured first** (`zig build bench-ingest -Doptimize=ReleaseFast`,
+engine inserts only — no parser — three id orders × scaling sizes):
+the sorted-insert memmove was **quadratic in the worst case** —
+reverse ids:1.36s @20k → **19.19s @100k (191.9 µs/row)** — while
+ascending stayed linear (98.6 ms) and lexicographic string ids (the
+E08/probe shape) sat in between (1.77 s).
+
+**Design**: `EngineStore.pending` — inserts are O(1) pushes (seq-tagged
+for deterministic last-write-wins) and the sorted invariant is restored
+**once per write burst** at reader seams: the `executeStatement` reader
+arm (covers every context incl. MEMORY sub-stores), `toIr` (all
+checkpoint/encode paths), WAL-replay end, `replayAsOf` view build,
+`dumpStore`. Flush = sort by (id, seq) → dedup → two-pointer merge (LWW),
+with a pure-append fast path (time-ordered loads skip sort+merge).
+A first-draft per-insert pending scan re-introduced quadratic cost
+(14.8 s @100k) — that lesson is why dedup happens at flush, not push.
+
+| insert order @100k | before | insert after | flush (once) | total |
+| --- | ---: | ---: | ---: | ---: |
+| ascending | 98.6 ms | ~105 ms (~1 µs/row) | ~60–230 ms* | ~0.3 s |
+| **reverse (worst)** | **19,189 ms** | **93 ms** | ~156 ms | **~244 ms (≈77×)** |
+| lex strings | 1,768 ms | 95 ms | ~191 ms | **~280 ms (≈6×)** |
+
+\* flush timings swing ±4× run-to-run on this box (memory-subsystem
+noise under the neighbour workload; insert numbers are stable) — the
+structural claim is the one that matters: **flat ~1 µs/row for every
+id order**, no quadratic anywhere. Correctness: pending never reaches
+output unordered (every reader flushes first); parity **57/57** + the
+full suite (upsert-LWW, forget-after-queue, replay, AS OF) pin it.
 
 ## M8b results (2026-10-08) — lazy history seam
 
