@@ -2,10 +2,15 @@
 
 All notable changes to nqlite-zig are documented here, newest first.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
-versioning starts at 0.0.x until the cutover criteria in [PLAN.md](PLAN.md)
-are met.
+versioning started at 0.0.x during bootstrap — **v0.1.0 is the first
+release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
+(digests · persistence · importer · perf · knot ADR · flagged default).
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-10-08
+
+First release: the complete nqlite → Zig migration (PLAN M0–M9).
 
 ### Added
 
