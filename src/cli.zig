@@ -79,6 +79,36 @@ pub const Session = struct {
         try self.out.append(self.gpa, '\n');
     }
 
+    /// One plan's outcome — shared by the text runner and the MCP tools
+    /// (both drive the same Database path the reference shares).
+    pub const PlanOutcome = union(enum) {
+        ok: []engine.QueryResult,
+        /// Engine failure — message without prefix (callers render it).
+        exec_err: []const u8,
+        /// WAL failure — already a full `ERR …` line.
+        wal_err: []const u8,
+    };
+
+    /// Execute a parsed plan: lazy-history ensure (issue #133) + engine
+    /// + WAL duties (`server.walAfterPlan`, shared with the line server).
+    pub fn execPlan(self: *Session, plan: []const ir.Statement) !PlanOutcome {
+        if (self.file) |*sf| {
+            if (server.Server.planNeedsHistory(plan)) {
+                sf.ensureHistory(&self.store) catch
+                    return .{ .exec_err = "failed to load history" };
+            }
+        }
+        const results = engine.executePlan(&self.store, plan) catch |e| {
+            const msg = if (self.store.err) |d| d.message else engine.errorVariant(e);
+            return .{ .exec_err = msg };
+        };
+        if (self.file) |*sf| {
+            const wal_err = server.walAfterPlan(sf, &self.store, plan, self.gpa);
+            if (wal_err.len != 0) return .{ .wal_err = wal_err };
+        }
+        return .{ .ok = results };
+    }
+
     /// Run one input (multi-statement, `;`-separated). Parse failures print
     /// `error: …` and return 0; execute failures abort the session (stderr +
     /// nonzero exit — the reference propagates an io error the same way).
@@ -101,27 +131,21 @@ pub const Session = struct {
             return 0;
         }
         const plan = outcome.ok;
-        // Lazy history (issue #133): temporal reads + PRUNE need the file log.
-        if (self.file) |*sf| {
-            if (server.Server.planNeedsHistory(plan)) {
-                sf.ensureHistory(&self.store) catch return error.HistoryLoadFailed;
-            }
-        }
-        const results = engine.executePlan(&self.store, plan) catch |e| {
-            // Mirrors the reference's `execute error: {e}` abort (stderr).
-            const msg = if (self.store.err) |d| d.message else engine.errorVariant(e);
-            std.debug.print("execute error: {s}\n", .{msg});
-            return error.ExecuteFailed;
-        };
-        if (self.file) |*sf| {
-            const wal_err = server.walAfterPlan(sf, &self.store, plan, self.gpa);
-            if (wal_err.len != 0) {
-                std.debug.print("{s}\n", .{wal_err});
+        switch (try self.execPlan(plan)) {
+            .ok => |results| {
+                for (results) |res| try self.printResult(res);
+                return plan.len;
+            },
+            .exec_err => |msg| {
+                // Mirrors the reference's `execute error: {e}` abort (stderr).
+                std.debug.print("execute error: {s}\n", .{msg});
+                return error.ExecuteFailed;
+            },
+            .wal_err => |msg| {
+                std.debug.print("{s}\n", .{msg}); // already "ERR …"
                 return error.WalFailed;
-            }
+            },
         }
-        for (results) |res| try self.printResult(res);
-        return plan.len;
     }
 
     /// CLI result format (differs from the line protocol): label line, then

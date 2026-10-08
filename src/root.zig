@@ -21,6 +21,8 @@ pub const bm25 = @import("bm25.zig");
 pub const storage = @import("storage.zig");
 pub const server = @import("server.zig");
 pub const cli = @import("cli.zig");
+// MCP stdio server (nql-mcp parity, NQL_IMPL=zig harness leg).
+pub const mcp = @import("mcp.zig");
 
 // Run every imported file's tests (zig runs tests of files reachable from
 // the root module).
@@ -39,6 +41,7 @@ test {
     _ = @import("results.zig");
     _ = @import("server.zig");
     _ = @import("cli.zig");
+    _ = @import("mcp.zig");
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.

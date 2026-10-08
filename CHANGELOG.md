@@ -10,6 +10,28 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ### Added
 
+- **MCP stdio server (`--mcp`) — the last leg of `NQL_IMPL=zig`** —
+  `nqlite_zig` now speaks the MCP protocol directly: a hand-rolled
+  newline-JSON-RPC loop (no rmcp/tokio — wire contract captured from
+  the reference: `initialize` → rmcp `3.5.1` handshake, `tools/list`
+  with the8 tools in alphabetical order + byte-identical
+  descriptions/schemas, `tools/call` for all8), a serde_json
+  `to_string_pretty`-shaped payload printer (2-space indent, sorted
+  map keys, widened-shortest floats, `0.0` never `0`), the reference's
+  exact messages (`OK` / `ERR {e}` / `invalid record id …` /
+  `steps must contain at least one hop` / `ERR unknown ORDER BY …`),
+  `MATCH {start}` kind labels (no hops — unlike the line protocol),
+  `-32601` for unknown methods, notifications answered with silence.
+  Reuses `cli.Session` — the shared Database path (lazy history + WAL
+  duties) after extracting `Session::execPlan` from the CLI runner.
+  **Oracle-proven: deep-equal against the captured `nql-mcp`
+  responses on every value** (handshake, all schemas, execute_nql +
+  select payloads, stderr banner); exp09 `mcp_parity` green fully-on
+  (`NQL_IMPL=zig`: tools_present, as_of_via_nql, memory_via_nql,
+  deterministic_results, select_tool_as_of_param all ✓) and the
+  explicit-11 parity holds **57/57** with MCP flipped. The flag now
+  selects **all three legs: server + CLI + MCP**. +5 tests (46 total).
+
 - **CLI (`--script` / REPL / `--db`)** — `nqlite_zig` now carries the
   reference `nql` CLI surface: parse → execute with **no analyzer pass
   and no cross-line context** (`Session::run` parity), CLI result
