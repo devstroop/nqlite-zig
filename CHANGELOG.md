@@ -40,6 +40,18 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
   `dir+crc ≈100 ms` → ~9 ms (**−85 ms**). Byte-identity: every-length
   ladder test + fixtures/WAL + exp01–exp11 digests (the bench's XOR
   checksums cancel to0 in-process).
+- **mmap open (read-into-arena → read-only mapping)** — `loadMain` and
+  the lazy `takeHistory` re-read now decode straight from a
+  whole-file `posix.mmap` (`MAP_PRIVATE`, page-aligned; read path kept
+  as fallback). Zero-copy decode means the store BORROWS the mapping —
+  it lives on `StoreFile` and is unmapped in `close()` (the naive
+  map-decode-unmap segfaulted; reopen/lazy-history tests caught it).
+  Measured on a66.4 MB /100k store (interleaved A/B,5 rounds,
+  spawn→first response): **315.5 →231.5 ms median (−84 ms, −27%)**.
+  VmRSS unchanged by design (file pages count either way) — the memory
+  win is reclaimability (clean file-backed vs pinned anonymous arena).
+  Byte-identity: fixtures + reopen suite + exp01–exp11 =57/57 +
+  tcp_probe IDENTICAL.
 
 - **Harness default flip — zig runs all three legs out of the box** —
   `NQL_IMPL` now *opts out* (`=rust`) instead of opting in; unset (or
