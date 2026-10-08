@@ -10,6 +10,17 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ### Changed
 
+- **Harness default flip — zig runs all three legs out of the box** —
+  `NQL_IMPL` now *opts out* (`=rust`) instead of opting in; unset (or
+  `=zig`) = zig for server + CLI + MCP (`nqlite_zig --mcp`).
+  Precedence unchanged: explicit `NQL_*_BIN` > `NQL_IMPL` > default.
+  Evidence binding records the RESOLVED profile (default → `zig`,
+  `NQL_IMPL=rust` → `debug`, cross-wired → `mixed`). Gates: default
+  `run_all exp05 exp09` failures 0 with `profile: zig`; opt-out
+  failures 0 with `profile: debug`; explicit exp01–exp11 parity
+  **57/57**. (The experiments README section describing the old flag
+  semantics is the user's active editor file — handed over as a patch.)
+
 - **Spec pin → `a1ed5ff` — file-extension split (`.ndb` vs `.nql`)** —
   the store is now the **neural database file** (`.ndb`; sidecars
   `.ndb.wal` / `.ndb.lock`), while **`.nql` is reserved for NQL program
