@@ -105,7 +105,7 @@ to be sound). Probe: `scripts/probe_ceiling.py` / `scripts/probe_reopen.py`.
 | BM25 k=10 | 263 ms | **80 ms** | version-keyed index cache + binary-search tf/df |
 | hybrid (RRF) | 496 ms | **326 ms** | both of the above (fusion still needs two full rankings for ranks) |
 | `ORDER BY … LIMIT 10` | 75 ms | **40 ms** | top-k selection |
-| full-scan + response100k | 551 ms | **formatting 138 → 28 ms in-process** | response formatting fixed (M8++ below); end-to-end scan now engine-bound (external timing noise-bound on this box) |
+| full-scan + response100k | 551 ms | **zig-side ≈55 ms** (engine27 + format28, in-process) | formatting −5× (M8++) + projection zero-alloc; the external row was mostly **harness-python parsing the5 MB line** + box noise — see M8++ |
 
 **kNN @100k = 49 ms beats the reference band (Rust release75–140 ms)** —
 the plan's "exact kNN ≥ Rust" cutover criterion. All changes are
@@ -155,9 +155,30 @@ Mechanism: one pre-sized response buffer; `score4Into`/`idInto`/
 byte-identical — same half-to-even tie rule, same escaping; pub wrappers
 keep `rustFormat4`/`formatFields` for CLI/MCP callers). Byte-proof:
 golden/transcript tests + explicit exp01–exp11 digests + `tcp_probe`.
-Attribution correction: formatting was ~138 ms of the551 ms
-full-scan+response row — the rest is engine projection scan, which is
-now the dominant cost (and box-noisy to measure externally).
+
+**Second pass — engine select attribution (`zig build bench-query`)**,
+also median-of7 ×100k synthesized rows, in-process:
+
+| shape (`SELECT … FROM doc`,100k rows) | before | after |
+| --- | ---: | ---: |
+| star (`SELECT *`) | 22–25 ms | (unchanged) |
+| projection (`SELECT topic`) | **48.0 ms** | **27.0 ms** |
+| filter (`WHERE topic = …`,25k matches) | 12–14 ms | (unchanged) |
+
+Projection kept a per-row `ArrayList` (`kept.append` =2–4 heap allocs
+per row); now fully-kept bodies reuse the same slice (zero alloc),
+empty results share one static slice, partial matches copy once.
+
+**Attribution correction (replaces the earlier note)**: formatting was
+~138 ms of the old551 ms full-scan+response row — engine select was
+NEVER the dominant cost (27–48 ms). The external row is dominated by
+**harness-python parsing the multi-MB response line** plus box noise
+(an interleaved old/new A/B measured291–647 ms for identical code).
+Zig-side full-scan pipeline today: engine ≈27 + formatting ≈28 ≈
+**55 ms @100k rows** (was ≈48 +138 ≈186 ms). Remaining zig-side
+open items by honest size: SIMD CRC on decode (dir+crc ≈100 ms →
+−20…−40 — the earlier “−80…−90” assumed a bigger CRC share), mmap
+(read ≈43–76 ms → −20…−40 +62 MB RSS), ingest O(n²) beyond100k.
 
 ## M8b results (2026-10-08) — lazy history seam
 

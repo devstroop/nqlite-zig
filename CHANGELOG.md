@@ -19,6 +19,15 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
   micro-bench = the trusted method (external process timing on this
   box swings ±2×). Pub wrappers keep `rustFormat4`/`formatFields`
   for CLI/MCP callers.
+- **Field-projection path zero-alloc** — `SELECT <fields>` kept a
+  per-row `ArrayList` (engine `runSelect`): projection was48 ms vs22
+  ms star @100k (`zig build bench-query`). Fully-kept bodies now keep
+  the SAME slice (zero alloc), empty results share a static slice,
+  partial matches copy once → **48.0 →27.0 ms**, byte-identical order
+  and values (suite + exp01–exp11 digests pin it). Together with the
+  formatting fix: zig-side full-scan pipeline ≈**186 →55 ms @100k**
+  (engine + response); attribution note in BENCHMARKING.md corrected
+  (the external551 ms row was mostly harness-python line parsing).
 
 - **Harness default flip — zig runs all three legs out of the box** —
   `NQL_IMPL` now *opts out* (`=rust`) instead of opting in; unset (or
