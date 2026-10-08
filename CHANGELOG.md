@@ -28,6 +28,18 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
   formatting fix: zig-side full-scan pipeline ≈**186 →55 ms @100k**
   (engine + response); attribution note in BENCHMARKING.md corrected
   (the external551 ms row was mostly harness-python line parsing).
+- **CRC-32 SIMD (PCLMULQDQ) — the crc32fast-class lever, measured10.7×** —
+  `crc32fast1.5.2`'s pclmul algorithm ported verbatim to
+  `src/crc32_simd.c` (header-free: one clang builtin + vector
+  extensions; per-function `target(...)` = Rust's `#[target_feature]`;
+  zig's asm encoder can't assemble non-baseline instructions and
+  `<emmintrin.h>` drags in libc — hence C). Runtime cpuid gate
+  (`usePclmul`), non-x86 comptime-dead, slice-by-8 stays the fallback.
+  Bench `zig build bench-crc`: **64 MB — slice-by-8100.16 ms (670
+  MB/s) → PCLMUL9.37 ms (7158 MB/s) =10.68×**; CRC share of reopen
+  `dir+crc ≈100 ms` → ~9 ms (**−85 ms**). Byte-identity: every-length
+  ladder test + fixtures/WAL + exp01–exp11 digests (the bench's XOR
+  checksums cancel to0 in-process).
 
 - **Harness default flip — zig runs all three legs out of the box** —
   `NQL_IMPL` now *opts out* (`=rust`) instead of opting in; unset (or
