@@ -9,6 +9,19 @@ are met.
 
 ### Added
 
+- **Importer proof — cutover criterion ✓** — the E08 100k store is
+  built exactly as `exp08` does (chunked `nql --db` → v3) and migrated
+  with `nql-migrate`; answers for7 query kinds (count / kNN / BM25 /
+  hybrid / LIMIT / AS OF / HISTORY SINCE) are **byte-identical**
+  between Rust-on-v3 (pre-migration) and **this implementation serving
+  the migrated v4** (post-migration + cross-impl file compatibility at
+  scale; `history = 100001` hard-asserted). Driver:
+  `nqlite-experiments/scripts/prove_migrate_100k.py` →
+  `results/migrate_100k.json`. The first run caught two reference-side
+  checkpoint bugs (nqlite **#155/#156** — lazy-tail history silently
+  rewritten as empty); Rust reading v4 itself is tracked as nqlite
+  **#157**.
+
 - **M8b lazy history seam (open parity)** — the reference's issue #133
   design ported: `v4.decodeCore` records the HISTORY section range
   instead of decoding it; `StoreFile.ensureHistory` (one-shot take)
