@@ -306,7 +306,7 @@ test "checkpoint → reopen round-trip" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(gpa, &tmp, "rt.nql");
+    const path = try testPath(gpa, &tmp, "rt.ndb");
 
     var sf = try StoreFile.open(path, gpa, io);
     var store = testStore(gpa);
@@ -332,7 +332,7 @@ test "WAL append + replay + torn-frame truncation" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(gpa, &tmp, "wal.nql");
+    const path = try testPath(gpa, &tmp, "wal.ndb");
     var good_len: u64 = 0;
     {
         var sf = try StoreFile.open(path, gpa, io);
@@ -374,7 +374,7 @@ test "single-writer lock" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(gpa, &tmp, "lock.nql");
+    const path = try testPath(gpa, &tmp, "lock.ndb");
 
     var first = try StoreFile.open(path, gpa, io);
     // Second open while held → Locked (the issue #84 contract).
@@ -395,7 +395,7 @@ test "WAL replay honors plan memory contexts (#109)" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(gpa, &tmp, "ctx.nql");
+    const path = try testPath(gpa, &tmp, "ctx.ndb");
 
     {
         var sf = try StoreFile.open(path, gpa, io);
@@ -441,7 +441,7 @@ test "PRUNE frame in WAL replays against the file history (lazy seam edge)" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(gpa, &tmp, "prunewal.nql");
+    const path = try testPath(gpa, &tmp, "prunewal.ndb");
 
     // Main file with a real history (create@1, insert@2) via checkpoint.
     {

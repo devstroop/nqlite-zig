@@ -467,7 +467,7 @@ test "--db persists and reseeds declared tables" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(
         gpa,
-        "{s}/{s}/store.nql",
+        "{s}/{s}/store.ndb",
         .{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path },
     );
 
@@ -617,7 +617,7 @@ test "prune history preserves reseed across reopen" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(
         gpa,
-        "{s}/{s}/store.nql",
+        "{s}/{s}/store.ndb",
         .{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path },
     );
 
@@ -659,7 +659,7 @@ test "lazy history seam: file history decodes on first temporal read" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(
         gpa,
-        "{s}/{s}/store.nql",
+        "{s}/{s}/store.ndb",
         .{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path },
     );
 

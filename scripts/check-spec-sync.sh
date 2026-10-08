@@ -12,8 +12,8 @@ fail=0
 # file-format.md (§5) + the format-v4 golden-fixture oracle (§5.7: the
 # fixtures ARE the contract where prose is ambiguous).
 for f in nql.md file-format.md \
-         fixtures/v4/README.md fixtures/v4/empty.nql fixtures/v4/plain.nql \
-         fixtures/v4/rich.nql fixtures/v4/pruned.nql \
+         fixtures/v4/README.md fixtures/v4/empty.ndb fixtures/v4/plain.ndb \
+         fixtures/v4/rich.ndb fixtures/v4/pruned.ndb \
          fixtures/v4/statements.json fixtures/v4/manifest.json \
          fixtures/nql/README.md fixtures/nql/corpus.json \
          fixtures/engine/README.md fixtures/engine/results.json; do
