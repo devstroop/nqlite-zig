@@ -109,6 +109,24 @@ pub fn build(b: *std.Build) void {
     );
     bench_step.dependOn(&bench_cmd.step);
 
+    // Engine select-path micro-bench (projection vs star vs filter @100k):
+    //   zig build bench-query -Doptimize=ReleaseFast
+    const bench_q = b.addExecutable(.{
+        .name = "bench_query",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_query.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "nqlite_zig", .module = mod }},
+        }),
+    });
+    const bench_q_cmd = b.addRunArtifact(bench_q);
+    const bench_q_step = b.step(
+        "bench-query",
+        "Engine select micro-bench (median of7 ×100k rows,3 shapes)",
+    );
+    bench_q_step.dependOn(&bench_q_cmd.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
