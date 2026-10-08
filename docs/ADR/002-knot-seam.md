@@ -12,7 +12,7 @@
 | seam layer | what it actually is |
 | --- | --- |
 | dependency | git deps on `nql` + `nqlite` (`devstroop/nqlite`) |
-| storage | `Database::open(&path)` — the Rust file format (v3 today) |
+| storage | `Database::open(&path)` — the Rust file format (v2/v3/v4 since nqlite#157) |
 | execution | `nql::parse` → `db.execute(&plan)` → `nqlite` error/result types |
 | contract surface | the spec's semantics directly — its load tests assert the retention contract itself (`PRUNE HISTORY` binding history, `AS OF` failing with `HistoryPruned`, durability counts) |
 
@@ -55,10 +55,12 @@ require it, explicitly allowing "keep Rust for knot" as an outcome.
   semantics, same storage files — the audit adapter's behavior is
   pinned by the Rust crate for the coexistence period.
 - **Two engines coexist with knot on one of them.** Alignment is the
-  spec + shared harness (57/57) + fixtures; a knot that migrates a
-  store with `nql-migrate` gets a **v4 file the Rust loader cannot open
-  yet** (nqlite#157) — knot stays on v3 inputs until that lands; the
-  zig server reads both.
+  spec + shared harness (57/57) + fixtures + the importer proof
+  (`v3(rust) == v4(rust) == v4(zig)` on the E08 100k store). A
+  migrated store (`nql-migrate` output) is readable by **both** sides
+  since nqlite#157/#158 (v4 open + version-preserving checkpoint) —
+  knot may consume v4 inputs directly, and the zig server reads them
+  natively.
 - **Nothing here blocks cutover**: the criteria wanted this decision
   *recorded*, not a migration. The M9 default-flip applies to the
   experiments/harness layer, which already dual-runs both engines.

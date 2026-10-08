@@ -42,8 +42,9 @@ First release: the complete nqlite → Zig migration (PLAN M0–M9).
   `nqlite-experiments/scripts/prove_migrate_100k.py` →
   `results/migrate_100k.json`. The first run caught two reference-side
   checkpoint bugs (nqlite **#155/#156** — lazy-tail history silently
-  rewritten as empty); Rust reading v4 itself is tracked as nqlite
-  **#157**.
+  rewritten as empty); Rust serving the migrated v4 **landed in nqlite
+  #157/#158** (v4 open + version-preserving checkpoint) — the proof now
+  runs the full **v3(rust) == v4(rust) == v4(zig)** triangle.
 
 - **M8b lazy history seam (open parity)** — the reference's issue #133
   design ported: `v4.decodeCore` records the HISTORY section range
