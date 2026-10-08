@@ -3,13 +3,18 @@ const Io = std.Io;
 
 const nqlite_zig = @import("nqlite_zig");
 
-/// nqlite line-protocol server (`--stdio`): one nql program per line in,
-/// one response out — byte-identical to nql-server's stdio mode.
+/// nqlite server/CLI binary — four modes:
+/// * default      — the `nql` CLI (`--script FILE` / interactive REPL / `--db`)
+/// * `--stdio`    — line protocol on stdio, byte-identical to `nql-server --stdio`
+/// * `--tcp`      — line protocol over TCP on `127.0.0.1:$PORT` (env `PORT`,
+///   default 7878) = nql-server's default transport; one shared server
+///   across connections, sequential accept (same design)
+/// * `--mcp`      — MCP stdio server (nql-mcp parity)
 ///
 /// `--db <path>` (or `-d`) serves a persistent single-file store: lock,
 /// v4 load + WAL replay on open; per-plan WAL frames (+ #109 ContextReset)
-/// and threshold checkpoints while running. TCP mode (the reference's
-/// default) is not implemented yet.
+/// and threshold checkpoints while running. (The zig binary stays CLI-first:
+/// unlike nql-server — where TCP is the no-flag default — TCP is `--tcp`.)
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
@@ -17,6 +22,7 @@ pub fn main(init: std.process.Init) !void {
 
     var want_stdio = false;
     var want_mcp = false;
+    var want_tcp = false;
     var db_path: ?[]const u8 = null;
     var script_path: ?[]const u8 = null;
     var bad_arg = false;
@@ -28,6 +34,8 @@ pub fn main(init: std.process.Init) !void {
             want_stdio = true;
         } else if (std.mem.eql(u8, a, "--mcp")) {
             want_mcp = true;
+        } else if (std.mem.eql(u8, a, "--tcp")) {
+            want_tcp = true;
         } else if (std.mem.eql(u8, a, "--db") or std.mem.eql(u8, a, "-d")) {
             i += 1;
             if (i >= args.len) {
@@ -63,6 +71,23 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (want_tcp) {
+        if (bad_arg or want_stdio or want_mcp or script_path != null) {
+            std.debug.print("{s}\n", .{nqlite_zig.cli.USAGE});
+            std.process.exit(1);
+        }
+        // nql-server's default transport: `PORT` env or 7878 — resolved
+        // before we bind so a bad PORT fails loudly (the reference fails
+        // inside bind instead).
+        const port = nqlite_zig.server.parsePort(init.environ_map.get("PORT")) orelse {
+            std.debug.print("error: invalid PORT env (expected u16)\n", .{});
+            std.process.exit(1);
+        };
+        var server = makeServer(arena, io, db_path);
+        try nqlite_zig.server.runTcp(io, &server, port);
+        return;
+    }
+
     if (!want_stdio) {
         if (bad_arg) {
             std.debug.print("{s}\n", .{nqlite_zig.cli.USAGE});
@@ -77,14 +102,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var server = if (db_path) |p|
-        nqlite_zig.server.Server.open(arena, io, p) catch |e| {
-            // Same `error: …` + exit 1 convention as nql-server (issue #84).
-            std.debug.print("error: {s}\n", .{@errorName(e)});
-            std.process.exit(1);
-        }
-    else
-        nqlite_zig.server.Server.init(arena, io);
+    var server = makeServer(arena, io, db_path);
 
     // 1 MiB line buffer — corpus programs are far smaller; a longer line is
     // a protocol violation we refuse rather than silently truncate.
@@ -103,6 +121,22 @@ pub fn main(init: std.process.Init) !void {
         try out.flush(); // one response, flushed per line (reference behavior)
     }
     try out.flush();
+}
+
+/// One server (stdio + tcp modes share it): `--db` open or in-memory init,
+/// with nql-server's `error: …` + exit 1 convention (issue #84).
+fn makeServer(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    db_path: ?[]const u8,
+) nqlite_zig.server.Server {
+    return if (db_path) |p|
+        nqlite_zig.server.Server.open(arena, io, p) catch |e| {
+            std.debug.print("error: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        }
+    else
+        nqlite_zig.server.Server.init(arena, io);
 }
 
 test "simple test" {

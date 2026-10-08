@@ -33,6 +33,19 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ### Added
 
+- **TCP mode (`--tcp`) — nql-server's default transport** — listen on
+  `127.0.0.1:$PORT` (env `PORT`, default 7878): one shared server
+  (database) across connections, **sequential accept** (the reference's
+  "deterministic for sequential/single clients" design), one program
+  per line → response flushed per line; a disconnect ends only that
+  connection. `--db` opens once (single-writer lock held for the
+  process); stderr banner `nqlite_zig listening on …`. Parity probe
+  `scripts/tcp_probe.py` byte-compares Rust-vs-zig transcripts
+  (queries + reconnect persistence) over real sockets. Mode
+  divergence: the zig binary stays CLI-first — TCP is opt-in via
+  `--tcp` (nql-server makes it the no-flag default; `USAGE` is
+  untouched = the nql CLI contract, test-pinned).
+
 - **MCP stdio server (`--mcp`) — the last leg of `NQL_IMPL=zig`** —
   `nqlite_zig` now speaks the MCP protocol directly: a hand-rolled
   newline-JSON-RPC loop (no rmcp/tokio — wire contract captured from
