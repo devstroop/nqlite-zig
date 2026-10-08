@@ -108,25 +108,8 @@ pub const Server = struct {
         // first (the reference's order: WAL frames, then #109's ContextReset
         // marker, then a threshold checkpoint).
         if (self.file) |*sf| {
-            var logged = false;
-            for (plan) |stmt| {
-                if (engine.isMutating(stmt)) {
-                    sf.append(stmt) catch return "ERR wal append failed";
-                    logged = true;
-                }
-            }
-            if (logged) {
-                sf.append(.{ .context_reset = {} }) catch return "ERR wal append failed";
-                if (sf.needsCheckpoint()) {
-                    // A checkpoint writes `store.history` to the main file —
-                    // it must hold the FILE-era history too, or the lazy
-                    // seam would silently drop it (ensure before encode).
-                    sf.ensureHistory(&self.store) catch return "ERR checkpoint failed";
-                    const ir_store = engine.toIr(&self.store, gpa) catch return "ERR checkpoint failed";
-                    const bytes = v4.encode(ir_store, gpa) catch return "ERR checkpoint encode failed";
-                    sf.checkpoint(bytes) catch return "ERR checkpoint failed";
-                }
-            }
+            const wal_err = walAfterPlan(sf, &self.store, plan, gpa);
+            if (wal_err.len != 0) return wal_err;
         }
         for (plan) |stmt| {
             switch (stmt) {
@@ -148,7 +131,7 @@ pub const Server = struct {
     /// The reference's `needs_history` (lib.rs): statements that read the
     /// mutation history — temporal reads (`AS OF`), `HISTORY SINCE`, and
     /// `PRUNE HISTORY` (compaction retains declarations from the full log).
-    fn planNeedsHistory(plan: []const ir.Statement) bool {
+    pub fn planNeedsHistory(plan: []const ir.Statement) bool {
         for (plan) |s| {
             switch (s) {
                 .select => |sel| if (sel.as_of != null) return true,
@@ -203,6 +186,40 @@ fn seedFrom(self: *Server, store: *const engine.EngineStore) void {
 }
 
 // ---------------------------------------------------------------------------
+// Post-plan WAL duties (shared by the line server and the CLI --db path)
+// ---------------------------------------------------------------------------
+
+/// Append the plan's mutating frames + #109 ContextReset, then a threshold
+/// checkpoint that claims the lazy history tail first (issue #133 — an
+/// encode without it would write history without the file era). Returns ""
+/// or a response-style error string (identical behavior for every `--db`
+/// frontend: the reference's Database::execute does the same inside).
+pub fn walAfterPlan(
+    sf: *storage.StoreFile,
+    store: *engine.EngineStore,
+    plan: []const ir.Statement,
+    gpa: std.mem.Allocator,
+) []const u8 {
+    var logged = false;
+    for (plan) |stmt| {
+        if (engine.isMutating(stmt)) {
+            sf.append(stmt) catch return "ERR wal append failed";
+            logged = true;
+        }
+    }
+    if (logged) {
+        sf.append(.{ .context_reset = {} }) catch return "ERR wal append failed";
+        if (sf.needsCheckpoint()) {
+            sf.ensureHistory(store) catch return "ERR checkpoint failed";
+            const ir_store = engine.toIr(store, gpa) catch return "ERR checkpoint failed";
+            const bytes = v4.encode(ir_store, gpa) catch return "ERR checkpoint encode failed";
+            sf.checkpoint(bytes) catch return "ERR checkpoint failed";
+        }
+    }
+    return "";
+}
+
+// ---------------------------------------------------------------------------
 // Response formatting (byte-exact with the reference server)
 // ---------------------------------------------------------------------------
 
@@ -225,7 +242,7 @@ fn formatResult(gpa: std.mem.Allocator, res: engine.QueryResult) ![]const u8 {
 }
 
 /// `MATCH <start> ->:name <-:other` — arrows as the reference prints them.
-fn fmtPathLabel(gpa: std.mem.Allocator, kw: []const u8, path: ir.MatchPath) ![]const u8 {
+pub fn fmtPathLabel(gpa: std.mem.Allocator, kw: []const u8, path: ir.MatchPath) ![]const u8 {
     const start = try ir.recordIdDisplay(gpa, path.start);
     var hops: std.ArrayList(u8) = .empty;
     for (path.steps, 0..) |step, i| {
@@ -252,7 +269,7 @@ fn formatRow(gpa: std.mem.Allocator, row: engine.Row) ![]const u8 {
 }
 
 /// Rust `{:.4}` for an f32 (widened exactly to f64).
-fn rustFormat4(gpa: std.mem.Allocator, x: f32) std.mem.Allocator.Error![]const u8 {
+pub fn rustFormat4(gpa: std.mem.Allocator, x: f32) std.mem.Allocator.Error![]const u8 {
     const xf: f64 = x;
     const bits: u64 = @bitCast(xf);
     const negative = (bits >> 63) != 0; // includes −0.0 → "-0.0000"
@@ -276,7 +293,7 @@ fn rustFormat4(gpa: std.mem.Allocator, x: f32) std.mem.Allocator.Error![]const u
 
 /// BTree-order field rendering: `{k=v, k=v}` (or `{}` when empty).
 /// (Explicit error set: `formatFields` ⇄ `shortValue` recurse.)
-fn formatFields(gpa: std.mem.Allocator, body: []const ir.DocEntry) std.mem.Allocator.Error![]const u8 {
+pub fn formatFields(gpa: std.mem.Allocator, body: []const ir.DocEntry) std.mem.Allocator.Error![]const u8 {
     if (body.len == 0) return "{}";
     var inner: std.ArrayList(u8) = .empty;
     for (body, 0..) |e, i| {
