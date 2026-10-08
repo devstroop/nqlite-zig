@@ -9,6 +9,21 @@ are met.
 
 ### Added
 
+- **M8+ ceiling work (query + open)** — profile-driven follow-up bound
+  in `docs/BENCHMARKING.md`: **kNN @100k143→49 ms** (beats the Rust
+  release band75–140 — the cutover's "exact kNN ≥ Rust" criterion) via
+  top-k windowed selection (bounded heap, window ≤ n/8, total-order
+  comparators ⇒ identical bytes); **BM25263→80 ms** via a
+  version-keyed index cache (structurally sound only at the top-level
+  `.bm25` arm where candidates == the table — `matchesFilter` never
+  prunes) + binary-search tf/df; hybrid496→326 ms. **Open @100k
+  attributed**: `dir+crc` dominated `v4.decode` (253 ms of345) →
+  `crc32` rewritten slice-by-8 (same IEEE algorithm, bit-identical —
+  vectors + fixture/WAL gates; new cross-validation test) → reopen
+  ~460–625 → ~305–330 ms. Gates:35/35 tests, fmt/build/spec-sync,
+  **full `--all` parity57/57**. Deferred (documented): lazy history
+  decode (#133 seam), SIMD CRC, response formatting, mmap.
+
 - **M8 performance (E08 gate)** — the scale ladder (`compare_impls
   exp08`) no longer times out: **4/4 digests byte-identical, full
   `--all` parity 57/57 across all 11 experiments**. Profile-driven fixes

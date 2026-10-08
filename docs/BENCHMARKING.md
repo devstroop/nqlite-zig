@@ -78,14 +78,63 @@ All three query regressions were **quadratic** (×5 rows → ×19 time):
 
 ### Known gaps / deferred (honest list)
 
-- **SIMD exact kNN** and **mmap open** (plan M8's ceiling targets):
-  deferred — zig kNN @100k is205 ms vs the plan's single-digit-ms
-  ambition; profile shows the f32 cosine loop as the next candidate
-  (SIMD) and the v4 decode path as the reopen candidate (mmap).
-- **BM25 index is rebuilt per query** (parity with the reference's
-  behavior); at ≥100k a cached index keyed on store state is the next
-  lever (~381 ms → likely tens of ms).
+- ~~SIMD exact kNN~~ — **superseded**: top-k selection got kNN to
+  49 ms @100k (beats the reference band); literal SIMD on the cosine
+  loop remains optional (see M8+ below).
+- **mmap open** (plan M8's ceiling target): deferred — the decode path
+  was the actual open bottleneck (see M8+ attribution below).
+- ~~BM25 index rebuilt per query~~ — **fixed in M8+** (version-keyed
+  cache); see below.
 - **Ingest** uses sorted-insert memmove (O(n²) worst case) — flat
   enough through 100k (13k TPS) but will bend at bigger stores.
 - **MATCH/CLOSURE adjacency index** — edge scans are linear per step;
   not on exp08's path, deferred with the experiment suites still green.
+
+## M8+ results (2026-10-08) — query ceiling + open attribution
+
+All numbers below: same machine/profile bindings as above (ReleaseFast,
+Xeon box — note: the box was running a heavy neighbour workload,
+load ≈ 17/32, so small numbers carry ±noise; trends are large enough
+to be sound). Probe: `scripts/probe_ceiling.py` / `scripts/probe_reopen.py`.
+
+### Query pipeline @100k (median of 7)
+
+| query | before | after | mechanism |
+| --- | ---: | ---: | --- |
+| kNN k=10 | 143 ms | **49 ms** | top-k windowed selection (heap, window ≤ n/8) instead of full sort |
+| BM25 k=10 | 263 ms | **80 ms** | version-keyed index cache + binary-search tf/df |
+| hybrid (RRF) | 496 ms | **326 ms** | both of the above (fusion still needs two full rankings for ranks) |
+| `ORDER BY … LIMIT 10` | 75 ms | **40 ms** | top-k selection |
+| full-scan + response100k | 551 ms | ~550–660 | response formatting (deferred; fits budget) |
+
+**kNN @100k = 49 ms beats the reference band (Rust release75–140 ms)** —
+the plan's "exact kNN ≥ Rust" cutover criterion. All changes are
+byte-safe by construction (total-order comparators; fusion keeps the
+identical `+=` sequence) and verified: **`compare_impls --all` = 57/57
+digests across all 11 experiments, exit 0.**
+
+### Open path @100k (attributed with in-process phase timers)
+
+| phase | ms | note |
+| --- | ---: | --- |
+| file read (62.5 MB) | 43–76 | page-cache warm |
+| `v4.decode` | 200–345 | **before the CRC fix, `dir+crc` alone was253 ms (66%)** — the byte-at-a-time CRC ran at ~247 MB/s |
+| ├ dir + section CRCs | **100 after slice-by-8** | same IEEE algorithm, bit-identical (vectors + fixture/WAL gates) |
+| ├ records | 55–103 | bodies + embeddings |
+| └ history | 75–141 | eager today — lazy decode is the next lever |
+| `fromIr` (100k inserts) | 58–84 | canonical append order |
+| WAL replay + seed | 6–9 | |
+| **process reopen (spawn → first response)** | **~305–330 best-of-3** (was ~460–625) | vs Rust reference: cold ~459 / warm ~260 |
+
+### Open: what's still deferred
+
+- **Lazy history decode** (the reference's issue #133 seam): decode core
+  only, decode + prepend the HISTORY section on the first temporal read.
+  Estimated −75…−140 ms (history = 75–141 ms eager); needs the
+  `needs_history` trigger + ensure-before-PRUNE-during-replay edge.
+- **CRC32 SIMD** (crc32fast-class, ~5–10× over slice-by-8): −80…−90 ms.
+- **mmap** instead of read-into-arena.
+- The in-test attribution harness (phase timers inside a `zig build
+  test`) proved unreliable at `-Ofast` under machine load (a false
+  “hang”); server-side phase timers + the reopen probe were the
+  workable method — use those.

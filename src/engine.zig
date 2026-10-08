@@ -69,8 +69,21 @@ pub const EngineStore = struct {
     clock: i64 = 0,
     history: std.ArrayList(ir.HistoryEntry) = .empty,
     memories: std.ArrayList(Memory) = .empty,
+    /// Bumped whenever `records` changes — keys the BM25 index cache.
+    mut_version: u64 = 0,
+    /// Cached BM25 index over a whole table (only built from the
+    /// top-level `.bm25` arm, where the filter never prunes and
+    /// candidates == the table's records); invalidated by `mut_version`.
+    bm25_cache: ?Bm25Cache = null,
     /// Last rich failure (cleared per server line by the caller).
     err: ?EngineFail = null,
+
+    const Bm25Cache = struct {
+        table: []const u8,
+        field: []const u8,
+        version: u64,
+        index: bm25mod.Bm25Index,
+    };
 
     /// A named memory partition (root-level, like the reference engine).
     pub const Memory = struct {
@@ -97,6 +110,7 @@ pub const EngineStore = struct {
 
     /// BTreeMap::insert semantics: replace in place, else sorted insert.
     pub fn insert(self: *EngineStore, rec: ir.Record) !void {
+        self.mut_version +%= 1;
         if (self.findIndex(rec.id)) |i| {
             self.records.items[i] = rec;
             return;
@@ -111,6 +125,7 @@ pub const EngineStore = struct {
     }
 
     pub fn remove(self: *EngineStore, id: ir.RecordId) void {
+        self.mut_version +%= 1;
         if (self.findIndex(id)) |i| {
             _ = self.records.orderedRemove(i);
         }
@@ -454,6 +469,7 @@ fn executeStatement(store: *EngineStore, stmt: ir.Statement) EngineError!?QueryR
         // History compaction base: install the captured state (replay-only).
         .snapshot => |st| {
             store.records = .empty;
+            store.mut_version +%= 1; // even a snapshot with no records
             for (st.records) |r| try store.insert(r);
             store.edges = .empty;
             for (st.edges) |e| try store.edges.append(store.gpa, e);
@@ -639,7 +655,7 @@ fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
     if (sel.filter) |f| {
         switch (f) {
             .bm25 => |b| {
-                bm25_index = try bm25mod.Bm25Index.new(store.gpa, b.field, candidates.items);
+                bm25_index = try bm25IndexCached(store, sel.table, b.field, candidates.items);
                 bm25_tokens = try bm25mod.tokenize(store.gpa, b.query);
             },
             else => {},
@@ -713,7 +729,7 @@ fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
         }
     }
 
-    try orderRows(rows.items, sel);
+    rows.items = try orderRows(rows.items, sel);
 
     if (sel.offset) |off| {
         const skip = @min(off, rows.items.len);
@@ -740,6 +756,31 @@ fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
         }
     }
     return rows.items;
+}
+
+/// Cached BM25 index build — sound only where `candidates` is the whole
+/// table, which holds exactly at the top-level `.bm25` call site (that
+/// filter never prunes). Keyed on (mutation version, table, field); a
+/// hit skips the O(n) tokenize/build entirely.
+fn bm25IndexCached(
+    store: *EngineStore,
+    table: []const u8,
+    field: []const u8,
+    candidates: []const ir.Record,
+) EngineError!bm25mod.Bm25Index {
+    if (store.bm25_cache) |c| {
+        if (c.version == store.mut_version and
+            std.mem.eql(u8, c.table, table) and
+            std.mem.eql(u8, c.field, field)) return c.index;
+    }
+    const idx = try bm25mod.Bm25Index.new(store.gpa, field, candidates);
+    store.bm25_cache = .{
+        .table = table,
+        .field = field,
+        .version = store.mut_version,
+        .index = idx,
+    };
+    return idx;
 }
 
 /// Canonical position of `id` in a candidates slice (binary search;
@@ -1326,12 +1367,21 @@ fn matchesFieldPred(props: []const ir.DocEntry, f: ir.Filter) bool {
 // Ordering + scoring
 // ---------------------------------------------------------------------------
 
-fn orderRows(rows: []Row, sel: ir.Select) EngineError!void {
+/// Order rows, keeping only the paging window when a bounded top-k
+/// selection beats a full sort (window ≤ n/8). Returns the (possibly
+/// shortened) slice — byte-identical: the window is the prefix of the
+/// full sort under the same TOTAL-order comparator.
+fn orderRows(rows: []Row, sel: ir.Select) EngineError![]Row {
+    // Window = offset + limit (kNN/BM25 k / LIMIT); no cap → sort all.
+    const window: ?usize = if (effectiveLimit(sel)) |c|
+        (sel.offset orelse 0) + c
+    else
+        null;
     // ORDER BY <field> [DESC] — structural sort, id tie both ways.
     if (sel.order) |ord| {
         switch (ord) {
             .field => |f| {
-                insertionSort(Row, rows, f, struct {
+                return orderWindowed(rows, window, f, struct {
                     fn less(c: @TypeOf(f), a: Row, b: Row) bool {
                         const ka = bodyGet(a.record.body, c.key) orelse .null;
                         const kb = bodyGet(b.record.body, c.key) orelse .null;
@@ -1341,17 +1391,15 @@ fn orderRows(rows: []Row, sel: ir.Select) EngineError!void {
                         return ir.RecordId.less(a.record.id, b.record.id);
                     }
                 }.less);
-                return;
             },
             .recency => {
-                insertionSort(Row, rows, {}, struct {
+                return orderWindowed(rows, window, {}, struct {
                     fn less(_: void, a: Row, b: Row) bool {
                         const c = std.math.order(b.record.created_at, a.record.created_at);
                         if (c != .eq) return c == .lt;
                         return ir.RecordId.less(a.record.id, b.record.id);
                     }
                 }.less);
-                return;
             },
             else => {},
         }
@@ -1361,7 +1409,7 @@ fn orderRows(rows: []Row, sel: ir.Select) EngineError!void {
     if (sel.filter) |f| bm25_filter = f == .bm25;
     const score_based = sel.order != null or sel.knn != null or bm25_filter;
     if (score_based) {
-        insertionSort(Row, rows, {}, struct {
+        return orderWindowed(rows, window, {}, struct {
             fn less(_: void, a: Row, b: Row) bool {
                 if (a.score > b.score) return true;
                 if (a.score < b.score) return false;
@@ -1371,6 +1419,59 @@ fn orderRows(rows: []Row, sel: ir.Select) EngineError!void {
         }.less);
     }
     // else: BTree key order already (candidates came canonical).
+    return rows;
+}
+
+/// Full sort, or bounded top-k selection when the window is small
+/// relative to n (heap select O(n log w) + sort of w beats O(n log n)).
+fn orderWindowed(
+    rows: []Row,
+    window: ?usize,
+    ctx: anytype,
+    lessFn: fn (@TypeOf(ctx), Row, Row) bool,
+) []Row {
+    if (window) |w| {
+        if (w < rows.len and w > 0 and w * 8 <= rows.len) {
+            topSelect(Row, rows, w, ctx, lessFn);
+            return rows[0..w];
+        }
+    }
+    std.mem.sortUnstable(Row, rows, ctx, lessFn);
+    return rows;
+}
+
+/// Keep the `w` best elements under `lessFn` (a TOTAL order): bounded
+/// max-heap (root = worst kept), scan, then sort just the window.
+fn topSelect(comptime T: type, items: []T, w: usize, ctx: anytype, lessFn: fn (@TypeOf(ctx), T, T) bool) void {
+    const heap = items[0..w];
+    var i: usize = heap.len / 2;
+    while (i > 0) {
+        i -= 1;
+        siftDown(T, heap, i, ctx, lessFn);
+    }
+    for (items[w..]) |x| {
+        if (lessFn(ctx, x, heap[0])) {
+            heap[0] = x;
+            siftDown(T, heap, 0, ctx, lessFn);
+        }
+    }
+    std.mem.sortUnstable(T, heap, ctx, lessFn);
+}
+
+fn siftDown(comptime T: type, heap: []T, start: usize, ctx: anytype, lessFn: fn (@TypeOf(ctx), T, T) bool) void {
+    var i = start;
+    while (true) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        var worst = i;
+        if (l < heap.len and lessFn(ctx, heap[worst], heap[l])) worst = l;
+        if (r < heap.len and lessFn(ctx, heap[worst], heap[r])) worst = r;
+        if (worst == i) return;
+        const tmp = heap[i];
+        heap[i] = heap[worst];
+        heap[worst] = tmp;
+        i = worst;
+    }
 }
 
 fn reverseOrder(o: std.math.Order) std.math.Order {

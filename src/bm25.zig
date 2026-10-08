@@ -135,9 +135,29 @@ pub const Bm25Index = struct {
     }
 
     fn tf(counts: []const TokenCount, tok: []const u8) f32 {
-        for (counts) |tc| {
-            if (std.mem.eql(u8, tc.tok, tok)) return @floatFromInt(tc.count);
+        // counts are byte-sorted (BTreeMap order of the reference) →
+        // binary search (was a linear scan per query token per row).
+        var lo: usize = 0;
+        var hi: usize = counts.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.lessThan(u8, counts[mid].tok, tok)) lo = mid + 1 else hi = mid;
         }
+        if (lo < counts.len and std.mem.eql(u8, counts[lo].tok, tok))
+            return @floatFromInt(counts[lo].count);
+        return 0;
+    }
+
+    /// Document frequency of `tok` (0 when unseen) — `df` is byte-sorted.
+    fn dfOf(self: *const Bm25Index, tok: []const u8) f32 {
+        var lo: usize = 0;
+        var hi: usize = self.df.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.lessThan(u8, self.df[mid].tok, tok)) lo = mid + 1 else hi = mid;
+        }
+        if (lo < self.df.len and std.mem.eql(u8, self.df[lo].tok, tok))
+            return @floatFromInt(self.df[lo].count);
         return 0;
     }
 
@@ -179,13 +199,7 @@ pub const Bm25Index = struct {
             if (seen) continue;
             const f = tf(counts, tok);
             if (f == 0.0) continue;
-            var df_tok: f32 = 0;
-            for (self.df) |d| {
-                if (std.mem.eql(u8, d.tok, tok)) {
-                    df_tok = @floatFromInt(d.count);
-                    break;
-                }
-            }
+            var df_tok: f32 = self.dfOf(tok);
             if (df_tok < 1.0) df_tok = 1.0;
             // Natural log in f32 — bit-identical to Rust's `f32::ln` for the
             // corpus arguments (verified: musl-derived @log == glibc logf).
