@@ -129,7 +129,8 @@ digests across all 11 experiments, exit 0.**
 ### Open: what's still deferred
 
 - ~~Lazy history decode~~ — **done in M8b below**.
-- **CRC32 SIMD** (crc32fast-class, ~5–10× over slice-by-8): −80…−90 ms.
+- ~~CRC32 SIMD~~ — **done: PCLMULQDQ path,10.7× over slice-by-8**
+  (see "CRC SIMD results" below).
 - **mmap** instead of read-into-arena.
 - The in-test attribution harness (phase timers inside a `zig build
   test`) proved unreliable at `-Ofast` under machine load (a false
@@ -179,6 +180,37 @@ Zig-side full-scan pipeline today: engine ≈27 + formatting ≈28 ≈
 open items by honest size: SIMD CRC on decode (dir+crc ≈100 ms →
 −20…−40 — the earlier “−80…−90” assumed a bigger CRC share), mmap
 (read ≈43–76 ms → −20…−40 +62 MB RSS), ingest O(n²) beyond100k.
+
+## CRC SIMD results (2026-10-08) — PCLMULQDQ, the crc32fast-class lever
+
+**Method**: `zig build bench-crc -Doptimize=ReleaseFast` — both paths on
+the same 64 MB buffer, back-to-back in-process (median of7). The XOR
+checksum across the two loops cancels to0, i.e. **identical outputs in
+the same run**, on top of the every-length ladder test, golden fixtures,
+WAL frames and exp01–exp11 digests.
+
+| path | time (64 MB ×7) | throughput |
+| --- | ---: | ---: |
+| slice-by-8 (baseline/CI/non-x86) | 100.16 ms | 670 MB/s |
+| **PCLMULQDQ** | **9.37 ms** | **7158 MB/s** |
+| | | **10.68×** |
+
+Impact: section CRCs at open are ~62.5 MB → the CRC share of
+`dir+crc ≈100 ms` drops to ~9 ms (**−85 ms** on reopen; the earlier
+"−80…−90" estimate is now MEASUREED, not assumed).
+
+Implementation notes (why C): the crc32fast1.5.2
+`specialized/pclmulqdq.rs` algorithm ported **verbatim** (K-constants,
+fold-by-4, runtime tail masks, step-3 + Barrett) to
+`src/crc32_simd.c` — clang's per-function `target("pclmulqdq,...")`
+does what Rust's `#[target_feature]` does. zig inline asm was the dead
+end (the self-hosted encoder only assembles baseline features), and
+zig's vendored `<emmintrin.h>` chains into libc — so the file is
+header-free: one builtin (`__builtin_ia32_pclmulqdq128`) + vector
+extensions + scalar helpers for the cold shuffles. Runtime gate =
+`usePclmul()` (cpuid leaf1 ECX bit1), cached once; non-x86 builds never
+reference the symbol (comptime arch gate + build.zig only attaches the C
+on x86).
 
 ## M8b results (2026-10-08) — lazy history seam
 

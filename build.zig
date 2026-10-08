@@ -12,6 +12,10 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+    const is_x86 = switch (target.result.cpu.arch) {
+        .x86, .x86_64 => true,
+        else => false,
+    };
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
@@ -126,6 +130,34 @@ pub fn build(b: *std.Build) void {
         "Engine select micro-bench (median of7 ×100k rows,3 shapes)",
     );
     bench_q_step.dependOn(&bench_q_cmd.step);
+
+    // CRC micro-bench (slice-by-8 vs pclmulqdq, same buffer): `zig build bench-crc`
+    const bench_c = b.addExecutable(.{
+        .name = "bench_crc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_crc.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "nqlite_zig", .module = mod }},
+        }),
+    });
+    const bench_c_cmd = b.addRunArtifact(bench_c);
+    const bench_c_step = b.step("bench-crc", "CRC micro-bench (slice8 vs pclmul)");
+    bench_c_step.dependOn(&bench_c_cmd.step);
+
+    // CRC-32 SIMD path (src/crc32_simd.c — pclmulqdq, runtime-gated by
+    // `usePclmul()`): clang encodes it via per-function target attributes
+    // (zig's own asm encoder only knows baseline features). x86-only —
+    // crc32()'s comptime arch gate keeps the symbol unreferenced elsewhere.
+    if (is_x86) {
+        const crc_c: std.Build.Module.CSourceFile = .{
+            .file = b.path("src/crc32_simd.c"),
+            .flags = &.{"-O2"},
+        };
+        // Once on `mod` only — link objects propagate to every importer
+        // (exe/tests/benches), a second attach would duplicate the symbol.
+        mod.addCSourceFile(crc_c);
+    }
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
