@@ -240,6 +240,36 @@ pub fn recordIdDisplay(gpa: std.mem.Allocator, rid: RecordId) ![]const u8 {
     };
 }
 
+/// Parse `table:id` (reference `RecordId::parse`): first `:` splits, both
+/// parts non-empty; the id is a `u64` when the text parses as one (leading
+/// zeros allowed → Num), otherwise a string (negative/overflow/non-numeric).
+pub fn recordIdParse(s: []const u8) ?RecordId {
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const table = s[0..colon];
+    const id = s[colon + 1 ..];
+    if (table.len == 0 or id.len == 0) return null;
+    var n: u64 = 0;
+    var all_digits = true;
+    for (id) |c| {
+        if (c < '0' or c > '9') {
+            all_digits = false;
+            break;
+        }
+        n = std.math.mul(u64, n, 10) catch {
+            all_digits = false;
+            break;
+        };
+        n = std.math.add(u64, n, c - '0') catch {
+            all_digits = false;
+            break;
+        };
+    }
+    return .{
+        .table = table,
+        .id = if (all_digits) .{ .num = n } else .{ .str = id },
+    };
+}
+
 test "canonical RecordId order" {
     const a = RecordId{ .table = "a", .id = .{ .num = 5 } };
     const b = RecordId{ .table = "a", .id = .{ .str = "007" } };

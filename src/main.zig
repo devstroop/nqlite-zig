@@ -16,6 +16,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var want_stdio = false;
+    var want_mcp = false;
     var db_path: ?[]const u8 = null;
     var script_path: ?[]const u8 = null;
     var bad_arg = false;
@@ -25,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
         const a = args[i];
         if (std.mem.eql(u8, a, "--stdio")) {
             want_stdio = true;
+        } else if (std.mem.eql(u8, a, "--mcp")) {
+            want_mcp = true;
         } else if (std.mem.eql(u8, a, "--db") or std.mem.eql(u8, a, "-d")) {
             i += 1;
             if (i >= args.len) {
@@ -48,6 +51,17 @@ pub fn main(init: std.process.Init) !void {
     var out_buf: [1 << 16]u8 = undefined;
     var stdout: Io.File.Writer = .init(.stdout(), io, &out_buf);
     const out = &stdout.interface;
+
+    if (want_mcp) {
+        if (bad_arg) {
+            std.debug.print("{s}\n", .{nqlite_zig.cli.USAGE});
+            std.process.exit(1);
+        }
+        // MCP stdio mode (NQL_IMPL=zig harness leg): JSON-RPC over stdin/
+        // stdout, one response line per request (src/mcp.zig).
+        try nqlite_zig.mcp.run(arena, io, out, db_path);
+        return;
+    }
 
     if (!want_stdio) {
         if (bad_arg) {
