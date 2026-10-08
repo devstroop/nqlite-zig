@@ -15,7 +15,7 @@ bump) before code; gates below are *exit criteria*, not aspirations.
 | **M6** | Persistence | v4 + WAL + CRC, single-writer flock, reopen; **v3 importer** | persistence suite green + **import answers identical on the E08 100k store ✓** (2026-10-08: `nqlite-experiments/scripts/prove_migrate_100k.py` — **v3(rust) == v4(rust) == v4(zig)** triangle, `history = 100001`; surfaced reference checkpoint fixes nqlite #155/#156; Rust serving v4 ✓ nqlite #157/#158) |
 | **M7** | Temporal & graph | AS OF / HISTORY SINCE / PRUNE incl. `HistoryPruned` contracts; MATCH/CLOSURE + AS OF | E07-style rotation-equivalence checks green |
 | **M8** | Performance | **landed**: O(n log n) sorts, candidate-aligned kNN/RRF lookups, BM25 build/score fixes, top-k selection + index cache + slice-by-8 CRC + **lazy history decode** (bound numbers: docs/BENCHMARKING.md); **deferred**: SIMD CRC/kNN, mmap, adjacency index | **E08 gate: 4/4 + full parity 57/57** (was `B-TIMEOUT`); **kNN @100k49 ms beats Rust75–140**; open decode345→204 ms (`decodeCore`), seam unit-pinned |
-| **M9** | Cutover kit | experiments default flip (flagged ✓ — `NQL_IMPL=zig` flips **server + CLI + MCP** ✓), knot sidecar ADR (**ADR-002 ✓**), optional WASM spike, release ✓ (**v0.1.0**) | cutover criteria met (below) |
+| **M9** | Cutover kit | experiments default flip (**default ✓** — zig runs **server + CLI + MCP** out of the box; `NQL_IMPL=rust` opts back out; flag era ✓), knot sidecar ADR (**ADR-002 ✓**), optional WASM spike, release ✓ (**v0.1.0**) | cutover criteria met (below) |
 
 ## Parallel tracks (worktrees)
 
