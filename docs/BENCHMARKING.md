@@ -128,13 +128,31 @@ digests across all 11 experiments, exit 0.**
 
 ### Open: what's still deferred
 
-- **Lazy history decode** (the reference's issue #133 seam): decode core
-  only, decode + prepend the HISTORY section on the first temporal read.
-  Estimated −75…−140 ms (history = 75–141 ms eager); needs the
-  `needs_history` trigger + ensure-before-PRUNE-during-replay edge.
+- ~~Lazy history decode~~ — **done in M8b below**.
 - **CRC32 SIMD** (crc32fast-class, ~5–10× over slice-by-8): −80…−90 ms.
 - **mmap** instead of read-into-arena.
 - The in-test attribution harness (phase timers inside a `zig build
   test`) proved unreliable at `-Ofast` under machine load (a false
   “hang”); server-side phase timers + the reopen probe were the
   workable method — use those.
+
+## M8b results (2026-10-08) — lazy history seam
+
+The reference's issue #133 design, ported: `decodeCore` skips the
+HISTORY section (records its range), `ensureHistory` decodes it once
+and prepends file frames to the WAL-era log at the first temporal use
+(`needs_history`: AS OF / HISTORY SINCE / PRUNE at the server), before
+replaying a PRUNE WAL frame, and before every checkpoint (so a rewrite
+can never drop the file era).
+
+| phase (62.5 MB /100k store) | eager | lazy |
+| --- | ---: | ---: |
+| `v4` decode | 345 ms | **204 ms** (`decodeCore`, history ≈140 ms deferred) |
+| hist range recorded | — | `hist != null` until first temporal read (one-shot, unit-pinned) |
+| process reopen | ~305–390 | ~387–394 measured — **noise-bound on this box** (read43–83 + core204 + fromIr58–84 + spawn≈15; the box's neighbour workload moves totals ±90 ms run-to-run) |
+
+Byte-parity is the proof that matters: **full `--all` =57/57** with
+exp05 (reopen + AS OF), exp07 (temporal sweeps) and exp10 (forensics
+AS OF) byte-identical through the seam, plus the two new seam tests
+(temporal-after-reopen; PRUNE-in-WAL-with-main edge — without the
+ensure, compaction would drop file-era declarations).

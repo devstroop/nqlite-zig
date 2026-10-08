@@ -441,7 +441,15 @@ fn findSection(dir: []const DirEnt, tag: u32) ?DirEnt {
     return null;
 }
 
-pub fn decode(bytes: []const u8, gpa: std.mem.Allocator) Error!ir.Store {
+/// Section range of the HISTORY payload (absolute file offsets).
+pub const HistRange = struct { off: usize, len: usize };
+
+/// Decoded store without its history section (the reference's issue
+/// #133 lazy seam): `hist` marks where the section lives so the caller
+/// can decode it on first temporal use (`decodeHistoryAt`).
+pub const Core = struct { store: ir.Store, hist: ?HistRange };
+
+pub fn decodeCore(bytes: []const u8, gpa: std.mem.Allocator) Error!Core {
     const dir = try parseDir(bytes);
     defer std.heap.page_allocator.free(dir);
 
@@ -610,21 +618,44 @@ pub fn decode(bytes: []const u8, gpa: std.mem.Allocator) Error!ir.Store {
     const memories_out = try memories.toOwnedSlice(gpa);
     errdefer gpa.free(memories_out);
 
-    // HISTORY (§5.6): absent = empty (§5.1 errata).
-    var history: []const ir.HistoryEntry = &[_]ir.HistoryEntry{};
+    // HISTORY (§5.6): absent = empty (§5.1 errata) — LAZY: only the
+    // range is recorded here (CRCs were already verified by parseDir);
+    // `decodeHistoryAt` materializes it on first temporal use.
+    var hist: ?HistRange = null;
     if (findSection(dir, @backingInt(Tag.history))) |he| {
-        const h_bytes = bytes[he.off .. he.off + he.len];
-        var hr = payload.Reader.init(h_bytes);
-        history = try hr.historyVecInto(gpa);
-        if (hr.pos != h_bytes.len) return error.Trailing;
+        hist = .{ .off = he.off, .len = he.len };
     }
 
     return .{
-        .tables = tables,
-        .records = records_out,
-        .edges = edges_out,
-        .clock = clock,
-        .history = history,
-        .memories = memories_out,
+        .store = .{
+            .tables = tables,
+            .records = records_out,
+            .edges = edges_out,
+            .clock = clock,
+            .history = &[_]ir.HistoryEntry{},
+            .memories = memories_out,
+        },
+        .hist = hist,
     };
+}
+
+/// Decode the HISTORY section at `r` (range from `decodeCore`). The
+/// bytes must be the same file instance `parseDir` verified — the caller
+/// holds the single-writer lock, so no re-verification is needed.
+pub fn decodeHistoryAt(bytes: []const u8, r: HistRange, gpa: std.mem.Allocator) Error![]const ir.HistoryEntry {
+    if (r.off + r.len > bytes.len) return error.Truncated;
+    const h_bytes = bytes[r.off .. r.off + r.len];
+    var hr = payload.Reader.init(h_bytes);
+    const history = try hr.historyVecInto(gpa);
+    if (hr.pos != h_bytes.len) return error.Trailing;
+    return history;
+}
+
+/// Eager decode (fixtures, memory blobs, callers that want the full
+/// store): core + history inline — identical bytes, just not deferred.
+pub fn decode(bytes: []const u8, gpa: std.mem.Allocator) Error!ir.Store {
+    const c = try decodeCore(bytes, gpa);
+    var store = c.store;
+    store.history = if (c.hist) |r| try decodeHistoryAt(bytes, r, gpa) else &[_]ir.HistoryEntry{};
+    return store;
 }

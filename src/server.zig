@@ -90,6 +90,12 @@ pub const Server = struct {
         }
 
         // Execute only the original statements (skip the synthetic prefix).
+        // Lazy history (issue #133 seam): temporal reads and PRUNE need the
+        // full log — decode the file's HISTORY section on first use.
+        if (self.file) |*sf| {
+            if (planNeedsHistory(plan))
+                sf.ensureHistory(&self.store) catch return "ERR failed to load history";
+        }
         const results = engine.executePlan(&self.store, analyzed.ok[prefix_len..]) catch |e| {
             if (self.store.err) |d| {
                 return std.fmt.allocPrint(gpa, "ERR {s}", .{d.message}) catch "ERR out of memory";
@@ -112,6 +118,10 @@ pub const Server = struct {
             if (logged) {
                 sf.append(.{ .context_reset = {} }) catch return "ERR wal append failed";
                 if (sf.needsCheckpoint()) {
+                    // A checkpoint writes `store.history` to the main file —
+                    // it must hold the FILE-era history too, or the lazy
+                    // seam would silently drop it (ensure before encode).
+                    sf.ensureHistory(&self.store) catch return "ERR checkpoint failed";
                     const ir_store = engine.toIr(&self.store, gpa) catch return "ERR checkpoint failed";
                     const bytes = v4.encode(ir_store, gpa) catch return "ERR checkpoint encode failed";
                     sf.checkpoint(bytes) catch return "ERR checkpoint failed";
@@ -133,6 +143,23 @@ pub const Server = struct {
         }
         out.appendSlice(gpa, "OK") catch return "ERR out of memory";
         return out.toOwnedSlice(gpa) catch return "ERR out of memory";
+    }
+
+    /// The reference's `needs_history` (lib.rs): statements that read the
+    /// mutation history — temporal reads (`AS OF`), `HISTORY SINCE`, and
+    /// `PRUNE HISTORY` (compaction retains declarations from the full log).
+    fn planNeedsHistory(plan: []const ir.Statement) bool {
+        for (plan) |s| {
+            switch (s) {
+                .select => |sel| if (sel.as_of != null) return true,
+                .match_path => |p| if (p.as_of != null) return true,
+                .match_count => |p| if (p.as_of != null) return true,
+                .closure => |p| if (p.as_of != null) return true,
+                .history_since, .prune_history => return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn upsertDeclared(self: *Server, name: []const u8, dim: ?usize) void {
@@ -602,6 +629,55 @@ test "prune history preserves reseed across reopen" {
         // … while current reads are unaffected.
         const now = s.handleLine("SELECT * FROM t;");
         try std.testing.expect(std.mem.indexOf(u8, now, "t:1") != null);
+        s.file.?.close();
+    }
+}
+
+test "lazy history seam: file history decodes on first temporal read" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        gpa,
+        "{s}/{s}/store.nql",
+        .{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path },
+    );
+
+    // Session 1: real history, checkpointed (main file carries it).
+    {
+        var s = try Server.open(gpa, io, path);
+        try std.testing.expectEqualStrings("OK", s.handleLine("CREATE TABLE t;"));
+        try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO t:1 { \"a\": 1 };"));
+        try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO t:2 { \"a\": 2 };"));
+        const ir_store = try engine.toIr(&s.store, gpa);
+        const bytes = try v4.encode(ir_store, gpa);
+        try s.file.?.checkpoint(bytes);
+        s.file.?.close();
+    }
+
+    // Session 2: lazy load — history stays encoded until a temporal read.
+    {
+        var s = try Server.open(gpa, io, path);
+        try std.testing.expect(s.file.?.hist != null); // remembered, not decoded
+        // A non-temporal mutating line must NOT consume the seam.
+        try std.testing.expectEqualStrings("OK", s.handleLine("INSERT INTO t:3 { \"a\": 3 };"));
+        try std.testing.expect(s.file.?.hist != null);
+        // First temporal read: ensure (one-shot) + correct view of the file era.
+        const asof = s.handleLine("SELECT * FROM t AS OF 2;");
+        try std.testing.expect(std.mem.indexOf(u8, asof, "t:1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, asof, "t:2") == null);
+        try std.testing.expect(std.mem.indexOf(u8, asof, "t:3") == null);
+        try std.testing.expect(s.file.?.hist == null); // taken exactly once
+        // WAL-era insert merges onto the file era: full log = create+3 inserts.
+        const h = s.handleLine("HISTORY SINCE 0;");
+        try std.testing.expect(std.mem.startsWith(u8, h, "HISTORY SINCE 0 (4 rows)"));
+        // A later temporal read reuses the already-loaded history (no double prepend).
+        const asof3 = s.handleLine("SELECT * FROM t AS OF 3;");
+        try std.testing.expect(std.mem.indexOf(u8, asof3, "t:2") != null);
+        try std.testing.expect(std.mem.indexOf(u8, asof3, "t:3") == null);
         s.file.?.close();
     }
 }
