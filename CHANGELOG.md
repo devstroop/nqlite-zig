@@ -9,6 +9,20 @@ are met.
 
 ### Added
 
+- **M8 performance (E08 gate)** — the scale ladder (`compare_impls
+  exp08`) no longer times out: **4/4 digests byte-identical, full
+  `--all` parity 57/57 across all 11 experiments**. Profile-driven fixes
+  (ReleaseFast, bound numbers in `docs/BENCHMARKING.md`): corpus-sized
+  sorts moved from O(n²) insertion to PDQ (`std.mem.sortUnstable` — every
+  comparator is a total order, so results are byte-identical); per-row id
+  scans in the kNN/RRF score path replaced with candidate-aligned dense
+  lookups (fusion keeps the identical `+=` sequence → bit-identical f32
+  sums); BM25 builds sort `df` once after the merge and `score()` binary
+  searches docs. At 20k rows: kNN 3 920→31 ms, BM25 2 906→68 ms, hybrid
+  16 819→180 ms. Dead code removed (`upsertFused`/`Fused`, vestigial
+  kNN list). Deferred with gaps documented: SIMD kNN, mmap open, BM25
+  index caching, adjacency index.
+
 - **M7 temporal retention** — `PRUNE HISTORY` + `HISTORY SINCE` (the two
   statements still `NotImplemented` since M4): compaction replaces the
   history with the retained `CREATE TABLE` declarations (original

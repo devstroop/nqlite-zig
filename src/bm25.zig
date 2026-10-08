@@ -102,13 +102,16 @@ pub const Bm25Index = struct {
                 }
                 if (!found) try df.append(gpa, .{ .tok = tc.tok, .count = 1 });
             }
-            std.mem.sort(TokenCount, df.items, {}, struct {
-                fn lt(_: void, a: TokenCount, b: TokenCount) bool {
-                    return std.mem.lessThan(u8, a.tok, b.tok);
-                }
-            }.lt);
             try docs.append(gpa, .{ .id = rec.id, .counts = counts.items });
         }
+        // Sort the document frequencies ONCE after the merge (df is read by
+        // token equality — order never affects scores; the per-doc sort
+        // cost O(n_docs · |df| log |df|) and dominated index builds).
+        std.mem.sort(TokenCount, df.items, {}, struct {
+            fn lt(_: void, a: TokenCount, b: TokenCount) bool {
+                return std.mem.lessThan(u8, a.tok, b.tok);
+            }
+        }.lt);
         return .{
             .field = field,
             .docs = docs.items,
@@ -141,11 +144,16 @@ pub const Bm25Index = struct {
     /// BM25 score of `id` against `query_tokens` (0.0 when unindexed).
     pub fn score(self: *const Bm25Index, id: ir.RecordId, query_tokens: []const []const u8) f32 {
         var counts: []const TokenCount = &[_]TokenCount{};
-        for (self.docs) |d| {
-            if (ir.recordIdEql(d.id, id)) {
-                counts = d.counts;
-                break;
-            }
+        // `docs` follows canonical record order (unique keys) → binary
+        // search; a linear id scan here was O(n²) per query at scale.
+        var lo: usize = 0;
+        var hi: usize = self.docs.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (ir.RecordId.less(self.docs[mid].id, id)) lo = mid + 1 else hi = mid;
+        }
+        if (lo < self.docs.len and ir.recordIdEql(self.docs[lo].id, id)) {
+            counts = self.docs[lo].counts;
         }
         var doc_len_f: f32 = 0;
         for (counts) |tc| doc_len_f += @floatFromInt(tc.count);

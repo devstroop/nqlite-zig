@@ -56,8 +56,6 @@ pub const QueryResult = struct {
 
 /// A scored candidate (kNN similarity / BM25 / hybrid input).
 const Scored = struct { id: ir.RecordId, s: f32 };
-/// One fused RRF contribution.
-const Fused = struct { id: ir.RecordId, fused: f32 };
 
 // ---------------------------------------------------------------------------
 // Store (mutable engine state; canonical record order by construction)
@@ -621,17 +619,18 @@ fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
     }
 
     // kNN: exact cosine over embedded candidates (score desc, id asc, k=all).
-    var knn_sims: std.ArrayList(Scored) = .empty;
+    // `knn_dense` is the candidate-aligned lookup the row loop and the
+    // vector half of RRF read — O(1) per row instead of an O(n) id scan.
+    var knn_dense: []?f32 = &[_]?f32{};
     if (sel.knn) |knn| {
-        var scored: std.ArrayList(Scored) = .empty;
+        const dense = try store.gpa.alloc(?f32, candidates.items.len);
+        @memset(dense, null);
+        var ci: usize = 0;
         for (candidates.items) |rec| {
-            if (rec.embedding) |emb| {
-                try scored.append(store.gpa, .{ .id = rec.id, .s = cosineSimilarity(emb, knn.query) });
-            }
+            if (rec.embedding) |emb| dense[ci] = cosineSimilarity(emb, knn.query);
+            ci += 1;
         }
-        sortScoredDesc(scored.items);
-        if (scored.items.len > candidates.items.len) scored.items.len = candidates.items.len;
-        knn_sims = scored;
+        knn_dense = dense;
     }
 
     // BM25 over the filtered candidates.
@@ -648,8 +647,16 @@ fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
     }
 
     // Hybrid RRF fusion (K=60, rank 1-based, tie-break id asc).
-    var hybrid: std.ArrayList(Fused) = .empty;
+    // Fusion accumulates into a candidate-aligned dense array (binary-search
+    // position by id) — same += sequence per id as the old list upsert, so
+    // the f32 sums stay bit-identical; lookups become O(1) per row.
+    var fused: []f32 = &[_]f32{};
+    var fused_present = false;
     if (sel.knn != null and bm25_index != null) {
+        const fdense = try store.gpa.alloc(f32, candidates.items.len);
+        @memset(fdense, 0.0);
+        fused = fdense;
+        fused_present = true;
         const idx = &bm25_index.?;
         var lexical: std.ArrayList(Scored) = .empty;
         for (candidates.items) |rec| {
@@ -657,25 +664,24 @@ fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
         }
         sortScoredDesc(lexical.items);
         for (lexical.items, 0..) |e, rank| {
-            try upsertFused(&hybrid, store.gpa, e.id, 1.0 / (60.0 + @as(f32, @floatFromInt(rank + 1))));
+            fdense[candPos(candidates.items, e.id)] += 1.0 / (60.0 + @as(f32, @floatFromInt(rank + 1)));
         }
         var vector_l: std.ArrayList(Scored) = .empty;
-        for (candidates.items) |rec| {
-            const s: f32 = for (knn_sims.items) |kv| {
-                if (ir.recordIdEql(kv.id, rec.id)) break kv.s;
-            } else 0.0;
-            try vector_l.append(store.gpa, .{ .id = rec.id, .s = s });
+        for (candidates.items, 0..) |rec, i| {
+            try vector_l.append(store.gpa, .{ .id = rec.id, .s = knn_dense[i] orelse 0.0 });
         }
         sortScoredDesc(vector_l.items);
         for (vector_l.items, 0..) |e, rank| {
-            try upsertFused(&hybrid, store.gpa, e.id, 1.0 / (60.0 + @as(f32, @floatFromInt(rank + 1))));
+            fdense[candPos(candidates.items, e.id)] += 1.0 / (60.0 + @as(f32, @floatFromInt(rank + 1)));
         }
     }
 
     // Score every candidate.
     var rows: std.ArrayList(Row) = .empty;
-    for (candidates.items) |rec| {
-        const score = computeScore(store, sel, rec, knn_sims.items, &bm25_index, bm25_tokens, hybrid.items);
+    for (candidates.items, 0..) |rec, i| {
+        const kv: ?f32 = if (sel.knn != null) knn_dense[i] else null;
+        const fv: ?f32 = if (fused_present) fused[i] else null;
+        const score = computeScore(store, sel, rec, kv, fv, &bm25_index, bm25_tokens);
         try rows.append(store.gpa, .{ .record = rec, .score = score });
     }
 
@@ -736,32 +742,27 @@ fn runSelect(root: *EngineStore, sel: ir.Select) EngineError![]Row {
     return rows.items;
 }
 
-fn upsertFused(
-    list: *std.ArrayList(Fused),
-    gpa: std.mem.Allocator,
-    id: ir.RecordId,
-    add: f32,
-) !void {
-    for (list.items) |*e| {
-        if (ir.recordIdEql(e.id, id)) {
-            e.fused += add;
-            return;
-        }
+/// Canonical position of `id` in a candidates slice (binary search;
+/// candidates are unique and in RecordId order). Falls back to `len`
+/// for an absent id — fusion entries always come from candidates.
+fn candPos(candidates: []const ir.Record, id: ir.RecordId) usize {
+    var lo: usize = 0;
+    var hi: usize = candidates.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ir.RecordId.less(candidates[mid].id, id)) lo = mid + 1 else hi = mid;
     }
-    try list.append(gpa, .{ .id = id, .fused = add });
+    return lo;
 }
 
 fn sortScoredDesc(items: []Scored) void {
-    // Insertion sort — total order (score desc, id asc); corpus-sized inputs.
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        const x = items[i];
-        var j = i;
-        while (j > 0 and scoredBefore(x, items[j - 1])) : (j -= 1) {
-            items[j] = items[j - 1];
+    // Total order (score desc, id asc — ids unique): any correct sort
+    // algorithm yields the identical permutation; PDQ makes it O(n log n).
+    std.mem.sortUnstable(Scored, items, {}, struct {
+        fn less(_: void, a: Scored, b: Scored) bool {
+            return scoredBefore(a, b);
         }
-        items[j] = x;
-    }
+    }.less);
 }
 
 fn scoredBefore(a: Scored, b: Scored) bool {
@@ -1381,15 +1382,12 @@ fn reverseOrder(o: std.math.Order) std.math.Order {
 }
 
 fn insertionSort(comptime T: type, items: []T, ctx: anytype, lessFn: fn (@TypeOf(ctx), T, T) bool) void {
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        const x = items[i];
-        var j = i;
-        while (j > 0 and lessFn(ctx, x, items[j - 1])) : (j -= 1) {
-            items[j] = items[j - 1];
-        }
-        items[j] = x;
-    }
+    // PDQ via std (O(n log n); the old insertion sort was O(n²) and
+    // dominated large ORDER BY / kNN sorts). Every comparator here ends
+    // in a unique-key tie-break (RecordId), i.e. a TOTAL order — so the
+    // sorted result is byte-identical to insertion sort. ADR-001: the
+    // comparator defines determinism, not the algorithm.
+    std.mem.sortUnstable(T, items, ctx, lessFn);
 }
 
 fn clamp01(x: f32) f32 {
@@ -1402,15 +1400,13 @@ fn computeScore(
     store: *EngineStore,
     sel: ir.Select,
     rec: ir.Record,
-    knn_sims: []const Scored,
+    knn_sim: ?f32, // candidate-aligned kNN cosine (null = no kNN / unembedded)
+    fused: ?f32, // candidate-aligned RRF fusion (null = not hybrid)
     bm25_index: *const ?bm25mod.Bm25Index,
     bm25_tokens: []const []const u8,
-    hybrid: []const Fused,
 ) f32 {
     // Hybrid fusion dominates every score source.
-    for (hybrid) |h| {
-        if (ir.recordIdEql(h.id, rec.id)) return h.fused;
-    }
+    if (fused) |f| return f;
     // BM25 filter dominates ORDER BY / kNN.
     if (sel.filter) |f| {
         switch (f) {
@@ -1420,15 +1416,7 @@ fn computeScore(
             else => {},
         }
     }
-    var similarity: f32 = 0.0;
-    if (sel.knn != null) {
-        for (knn_sims) |kv| {
-            if (ir.recordIdEql(kv.id, rec.id)) {
-                similarity = kv.s;
-                break;
-            }
-        }
-    }
+    const similarity: f32 = knn_sim orelse 0.0;
     const ord = sel.order orelse return similarity;
     switch (ord) {
         .score => return scoreOf(store, rec),
