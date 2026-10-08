@@ -51,6 +51,9 @@ pub const StoreFile = struct {
     /// `close()` releases explicitly for tests/reopen).
     lock_fd: ?std.posix.fd_t = null,
     wal_len: u64 = 0,
+    /// HISTORY section range remembered by `loadMain` for the lazy seam
+    /// (reference issue #133): taken once by `takeHistory`.
+    hist: ?v4.HistRange = null,
 
     /// Open (or create) the store at `path`, taking the single-writer lock.
     /// A missing main file means an empty store (WAL still replays into it).
@@ -114,7 +117,9 @@ pub const StoreFile = struct {
 
     /// Load the main file (v4) — `null` means "empty store" (missing or
     /// shorter than a header, mirroring the reference's len < 16 rule).
-    pub fn loadMain(self: *const StoreFile) Error!?ir.Store {
+    /// The HISTORY section is NOT decoded here (issue #133 lazy seam):
+    /// `hist` records its range for `takeHistory`/`ensureHistory`.
+    pub fn loadMain(self: *StoreFile) Error!?ir.Store {
         const f = std.Io.Dir.cwd().openFile(self.io, self.main, .{}) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return error.Io,
@@ -124,8 +129,31 @@ pub const StoreFile = struct {
         if (st.size < 24) return null;
         const bytes = try self.gpa.alloc(u8, st.size);
         const n = f.readPositionalAll(self.io, bytes, 0) catch return error.Io;
-        const store = v4.decode(bytes[0..n], self.gpa) catch return error.Decode;
-        return store;
+        const core = v4.decodeCore(bytes[0..n], self.gpa) catch return error.Decode;
+        self.hist = core.hist;
+        return core.store;
+    }
+
+    /// One-shot decode of the HISTORY section (first temporal use).
+    /// The file bytes were CRC-verified at `loadMain` and the single-writer
+    /// lock is held, so the re-read cannot have changed.
+    pub fn takeHistory(self: *StoreFile) Error!?[]const ir.HistoryEntry {
+        const r = self.hist orelse return null;
+        self.hist = null;
+        const f = std.Io.Dir.cwd().openFile(self.io, self.main, .{}) catch return error.Io;
+        defer f.close(self.io);
+        const buf = try self.gpa.alloc(u8, r.len);
+        const n = f.readPositionalAll(self.io, buf, r.off) catch return error.Io;
+        if (n != r.len) return error.Decode;
+        return v4.decodeHistoryAt(buf[0..n], .{ .off = 0, .len = n }, self.gpa) catch return error.Decode;
+    }
+
+    /// Lazy-seam entry point: decode the file history (once) and PREPEND
+    /// it to `store.history` — file frames predate every WAL frame, which
+    /// is the reference's `ensure_history` prepend order.
+    pub fn ensureHistory(self: *StoreFile, store: *engine.EngineStore) Error!void {
+        const entries = (try self.takeHistory()) orelse return;
+        try store.history.insertSlice(self.gpa, 0, entries);
     }
 
     /// Replay WAL frames into `store` (statement contexts included — spec
@@ -159,6 +187,10 @@ pub const StoreFile = struct {
             var reader = payload.Reader.init(body);
             const stmt = reader.statement(self.gpa) catch break; // unparseable
             if (reader.pos != body.len) break;
+            // Compaction needs the FULL log (retain decls from the file
+            // era too — reference `needs_history(PruneHistory)`): load the
+            // lazy history before replaying a PRUNE frame.
+            if (stmt == .prune_history) try self.ensureHistory(store);
             // Replay is total on a valid store; any engine error here means
             // a corrupt frame — treat as torn (the reference panics).
             _ = engine.executeInContext(store, stmt, &current_memory) catch break;
@@ -400,4 +432,64 @@ test "WAL replay honors plan memory contexts (#109)" {
     try std.testing.expectEqualStrings("m", mem.name);
     try std.testing.expectEqual(@as(usize, 1), mem.store.records.items.len);
     try std.testing.expectEqual(@as(u64, 1), mem.store.records.items[0].id.id.num);
+}
+
+test "PRUNE frame in WAL replays against the file history (lazy seam edge)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(gpa, &tmp, "prunewal.nql");
+
+    // Main file with a real history (create@1, insert@2) via checkpoint.
+    {
+        var sf = try StoreFile.open(path, gpa, io);
+        var store = engine.EngineStore.init(gpa);
+        var ctx: ?[]const u8 = null;
+        _ = try engine.executeInContext(
+            &store,
+            .{ .create_table = .{ .table = "t", .vector_dim = null } },
+            &ctx,
+        );
+        _ = try engine.executeInContext(
+            &store,
+            .{ .insert = .{
+                .id = .{ .table = "t", .id = .{ .num = 1 } },
+                .body = &[_]ir.DocEntry{},
+                .embedding = null,
+                .created_at = 0,
+            } },
+            &ctx,
+        );
+        const ir_store = try engine.toIr(&store, gpa);
+        try sf.checkpoint(try v4.encode(ir_store, gpa));
+        // WAL after the checkpoint: a lone PRUNE frame.
+        try sf.append(.{ .prune_history = {} });
+        sf.close();
+    }
+
+    // Reopen: loadMain is lazy; replay must ensure the file history BEFORE
+    // executing PRUNE — otherwise compaction sees only the (empty) WAL-era
+    // log and drops the retained CREATE declaration.
+    var sf2 = try StoreFile.open(path, gpa, io);
+    defer sf2.close();
+    const loaded = (try sf2.loadMain()).?;
+    try std.testing.expect(loaded.history.len == 0); // lazy: not decoded yet
+    try std.testing.expect(sf2.hist != null);
+    var s2 = engine.EngineStore.init(gpa);
+    s2 = try engine.fromIr(gpa, loaded);
+    try sf2.replayWal(&s2);
+
+    // history = retained decl@1 + snapshot@2 (WITHOUT ensure it would be
+    // snapshot-only — the decl would be lost).
+    try std.testing.expectEqual(@as(usize, 2), s2.history.items.len);
+    try std.testing.expect(s2.history.items[0].stmt == .create_table);
+    try std.testing.expect(s2.history.items[1].stmt == .snapshot);
+    try std.testing.expectEqual(@as(i64, 2), s2.history.items[1].ts);
+    try std.testing.expect(sf2.hist == null); // consumed exactly once
+    // Data untouched by compaction.
+    try std.testing.expectEqual(@as(usize, 1), s2.records.items.len);
+    try std.testing.expectEqual(@as(i64, 2), s2.clock);
 }

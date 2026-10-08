@@ -9,6 +9,22 @@ are met.
 
 ### Added
 
+- **M8b lazy history seam (open parity)** — the reference's issue #133
+  design ported: `v4.decodeCore` records the HISTORY section range
+  instead of decoding it; `StoreFile.ensureHistory` (one-shot take)
+  decodes + **prepends** file frames to the WAL-era log on first use.
+  Triggers = the reference's `needs_history` (AS OF / HISTORY SINCE /
+  PRUNE in a plan, at the server), **before replaying a PRUNE WAL
+  frame** (compaction must retain file-era declarations), and **before
+  every checkpoint** (the encoded history must include the file era or
+  the rewrite would silently drop it). Measured: `decodeCore`204 ms vs
+ 345 ms eager on the62.5 MB /100k store (history ≈140 ms); reopen
+  total is noise-bound on this box (unit tests pin the seam:
+  `hist` non-null until the first temporal read, null after — exactly
+  once). Gates: **37/37 tests** (2 new seam tests: temporal-after-
+  reopen + PRUNE-in-WAL edge), fmt/build/spec-sync, **full `--all`
+  parity57/57** (exp05/07/10 reopen+AS OF byte-identical).
+
 - **M8+ ceiling work (query + open)** — profile-driven follow-up bound
   in `docs/BENCHMARKING.md`: **kNN @100k143→49 ms** (beats the Rust
   release band75–140 — the cutover's "exact kNN ≥ Rust" criterion) via
