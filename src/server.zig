@@ -223,7 +223,10 @@ pub fn walAfterPlan(
 // Response formatting (byte-exact with the reference server)
 // ---------------------------------------------------------------------------
 
-fn formatResult(gpa: std.mem.Allocator, res: engine.QueryResult) ![]const u8 {
+/// One response line: `<label> (<n> rows): <row>; <row>; …` — byte-exact
+/// with the reference (golden/transcript tests pin it). Also the
+/// `bench-format` entry point (pub for the bench, callers = this file).
+pub fn formatResult(gpa: std.mem.Allocator, res: engine.QueryResult) ![]const u8 {
     const label: []const u8 = switch (res.kind) {
         .select => |table| try std.fmt.allocPrint(gpa, "SELECT {s}", .{table}),
         .match_ => |path| try fmtPathLabel(gpa, "MATCH", path),
@@ -233,12 +236,21 @@ fn formatResult(gpa: std.mem.Allocator, res: engine.QueryResult) ![]const u8 {
     if (res.rows.len == 0) {
         return std.fmt.allocPrint(gpa, "{s} (0 rows)", .{label});
     }
-    var joined: std.ArrayList(u8) = .empty;
+    // One buffer for the whole response (was: ~6 heap allocations per row —
+    // id/score/fields/row-template — ≈550ms @100k; now one reserve + stack
+    // scratch only). Byte-identical: golden + transcript tests pin it.
+    var out: std.ArrayList(u8) = .empty;
+    out.ensureTotalCapacity(gpa, label.len + res.rows.len * 80 + 32) catch {};
+    try out.appendSlice(gpa, label);
+    try out.append(gpa, ' ');
+    var num_buf: [24]u8 = undefined;
+    const suffix = std.fmt.bufPrint(&num_buf, "({d} rows): ", .{res.rows.len}) catch unreachable;
+    try out.appendSlice(gpa, suffix);
     for (res.rows, 0..) |row, i| {
-        if (i > 0) try joined.appendSlice(gpa, "; ");
-        try joined.appendSlice(gpa, try formatRow(gpa, row));
+        if (i > 0) try out.appendSlice(gpa, "; ");
+        try formatRowInto(&out, gpa, row);
     }
-    return std.fmt.allocPrint(gpa, "{s} ({d} rows): {s}", .{ label, res.rows.len, joined.items });
+    return out.toOwnedSlice(gpa);
 }
 
 /// `MATCH <start> ->:name <-:other` — arrows as the reference prints them.
@@ -256,20 +268,34 @@ pub fn fmtPathLabel(gpa: std.mem.Allocator, kw: []const u8, path: ir.MatchPath) 
     return std.fmt.allocPrint(gpa, "{s} {s} {s}", .{ kw, start, hops.items });
 }
 
-/// `<id> score=<f:.4> {fields}` —4dp scores, EXACTLY like Rust's
-/// `{:.4}`: round-to-nearest with **half-to-EVEN on exact ties** (0.03125
-/// → `0.0312`, while zig's default `{d:.4}` rounds half-away → `0.0313`).
-/// The multiplication by 10^4 is exact for f32-sourced values (≤24-bit
-/// mantissa × 10^4 fits in 53 bits), so the tie test is sound.
-fn formatRow(gpa: std.mem.Allocator, row: engine.Row) ![]const u8 {
-    const id = try ir.recordIdDisplay(gpa, row.record.id);
-    const fields = try formatFields(gpa, row.record.body);
-    const score = try rustFormat4(gpa, row.score);
-    return std.fmt.allocPrint(gpa, "{s} score={s} {s}", .{ id, score, fields });
+/// Hot row path: appends `<id> score=<:.4> {fields}` into `out` with ZERO
+/// per-row heap allocations (stack scratch only) — byte-identical to the
+/// old allocating `formatRow` (pinned by the golden/transcript tests).
+fn formatRowInto(out: *std.ArrayList(u8), gpa: std.mem.Allocator, row: engine.Row) !void {
+    var id_buf: [512]u8 = undefined;
+    const id: []const u8 = idInto(&id_buf, row.record.id) orelse
+        try ir.recordIdDisplay(gpa, row.record.id); // rare: overlong ids
+    try out.appendSlice(gpa, id);
+    try out.appendSlice(gpa, " score=");
+    var score_buf: [64]u8 = undefined;
+    try out.appendSlice(gpa, score4Into(&score_buf, row.score));
+    try out.append(gpa, ' ');
+    try fieldsInto(out, gpa, row.record.body);
 }
 
-/// Rust `{:.4}` for an f32 (widened exactly to f64).
-pub fn rustFormat4(gpa: std.mem.Allocator, x: f32) std.mem.Allocator.Error![]const u8 {
+/// `table:id` into `buf` — null when the buffer is too small.
+fn idInto(buf: []u8, rid: ir.RecordId) ?[]const u8 {
+    return switch (rid.id) {
+        .num => |n| std.fmt.bufPrint(buf, "{s}:{d}", .{ rid.table, n }) catch null,
+        .str => |s| std.fmt.bufPrint(buf, "{s}:{s}", .{ rid.table, s }) catch null,
+    };
+}
+
+/// Rust `{:.4}` for an f32 (widened exactly to f64) — into `buf`; the math
+/// is identical to the original `rustFormat4`: round-to-nearest with
+/// half-to-EVEN on exact ties (0.03125 → `0.0312`), exact multiplication
+/// for f32-sourced values.
+fn score4Into(buf: []u8, x: f32) []const u8 {
     const xf: f64 = x;
     const bits: u64 = @bitCast(xf);
     const negative = (bits >> 63) != 0; // includes −0.0 → "-0.0000"
@@ -288,68 +314,94 @@ pub fn rustFormat4(gpa: std.mem.Allocator, x: f32) std.mem.Allocator.Error![]con
     const int_part = n / 10000;
     const frac_part = n % 10000;
     const sign: []const u8 = if (negative) "-" else "";
-    return std.fmt.allocPrint(gpa, "{s}{d}.{d:0>4}", .{ sign, int_part, frac_part });
+    return std.fmt.bufPrint(buf, "{s}{d}.{d:0>4}", .{ sign, int_part, frac_part }) catch unreachable;
 }
 
-/// BTree-order field rendering: `{k=v, k=v}` (or `{}` when empty).
-/// (Explicit error set: `formatFields` ⇄ `shortValue` recurse.)
+/// Allocating wrapper over `score4Into` (kept for the CLI/MCP callers;
+/// the response hot path uses the Into form directly).
+pub fn rustFormat4(gpa: std.mem.Allocator, x: f32) std.mem.Allocator.Error![]const u8 {
+    var buf: [64]u8 = undefined;
+    return gpa.dupe(u8, score4Into(&buf, x));
+}
+
+/// BTree-order field rendering: `{k=v, k=v}` (or `{}` when empty) —
+/// appends into `out` (no per-entry allocations on the hot path).
+fn fieldsInto(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const ir.DocEntry) std.mem.Allocator.Error!void {
+    if (body.len == 0) {
+        try out.appendSlice(gpa, "{}");
+        return;
+    }
+    try out.append(gpa, '{');
+    for (body, 0..) |e, i| {
+        if (i > 0) try out.appendSlice(gpa, ", ");
+        try out.appendSlice(gpa, e.key);
+        try out.append(gpa, '=');
+        try shortValueInto(out, gpa, e.value);
+    }
+    try out.append(gpa, '}');
+}
+
+/// Allocating wrapper over `fieldsInto` (CLI callers; the server response
+/// path uses the Into form directly).
 pub fn formatFields(gpa: std.mem.Allocator, body: []const ir.DocEntry) std.mem.Allocator.Error![]const u8 {
     if (body.len == 0) return "{}";
-    var inner: std.ArrayList(u8) = .empty;
-    for (body, 0..) |e, i| {
-        if (i > 0) try inner.appendSlice(gpa, ", ");
-        try inner.appendSlice(gpa, e.key);
-        try inner.append(gpa, '=');
-        try inner.appendSlice(gpa, try shortValue(gpa, e.value));
-    }
-    return std.fmt.allocPrint(gpa, "{{{s}}}", .{inner.items});
+    var out: std.ArrayList(u8) = .empty;
+    try fieldsInto(&out, gpa, body);
+    return out.toOwnedSlice(gpa);
 }
 
 /// Values shortened exactly like the nql CLI: vectors/arrays truncated,
-/// strings Rust-debug-quoted, floats via Rust's `{}` Display.
-/// (Explicit error set: `formatFields` ⇄ `shortValue` recurse.)
-fn shortValue(gpa: std.mem.Allocator, v: ir.Value) std.mem.Allocator.Error![]const u8 {
+/// strings Rust-debug-quoted, floats via Rust's `{}` Display — appended
+/// into `out` (recursion shares one buffer).
+fn shortValueInto(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: ir.Value) std.mem.Allocator.Error!void {
     switch (v) {
-        .null => return "null",
-        .bool => |b| return if (b) "true" else "false",
-        .int => |n| return std.fmt.allocPrint(gpa, "{d}", .{n}),
+        .null => try out.appendSlice(gpa, "null"),
+        .bool => |b| try out.appendSlice(gpa, if (b) "true" else "false"),
+        .int => |n| {
+            var b: [24]u8 = undefined;
+            try out.appendSlice(gpa, std.fmt.bufPrint(&b, "{d}", .{n}) catch unreachable);
+        },
         // Rust `{}` for f64 = shortest round-trip, NEVER exponential; zig's
         // `{d}` may emit `e` notation for extreme values (not present in the
         // E01–E05 corpora — tracked as a known gap).
-        .float => |f| return std.fmt.allocPrint(gpa, "{d}", .{f}),
-        .str => |s| return rustDebugString(gpa, s),
-        .doc => |entries| return formatFields(gpa, entries),
+        .float => |f| {
+            var b: [48]u8 = undefined;
+            try out.appendSlice(gpa, std.fmt.bufPrint(&b, "{d}", .{f}) catch unreachable);
+        },
+        .str => |s| try debugStrInto(out, gpa, s),
+        .doc => |entries| try fieldsInto(out, gpa, entries),
         .arr => |items| {
-            var shown: std.ArrayList(u8) = .empty;
+            try out.append(gpa, '[');
             var n: usize = 0;
             for (items) |it| {
                 if (n == 3) break;
-                if (n > 0) try shown.appendSlice(gpa, ", ");
-                try shown.appendSlice(gpa, try shortValue(gpa, it));
+                if (n > 0) try out.appendSlice(gpa, ", ");
+                try shortValueInto(out, gpa, it);
                 n += 1;
             }
-            return std.fmt.allocPrint(gpa, "[{s}]", .{shown.items});
+            try out.append(gpa, ']');
         },
         .vector => |dims| {
-            var shown: std.ArrayList(u8) = .empty;
+            try out.append(gpa, '[');
             var n: usize = 0;
             for (dims) |x| {
                 if (n == 4) break;
-                if (n > 0) try shown.appendSlice(gpa, ", ");
-                try shown.appendSlice(gpa, try std.fmt.allocPrint(gpa, "{d}", .{x}));
+                if (n > 0) try out.appendSlice(gpa, ", ");
+                var b: [48]u8 = undefined;
+                try out.appendSlice(gpa, std.fmt.bufPrint(&b, "{d}", .{x}) catch unreachable);
                 n += 1;
             }
-            const more: []const u8 = if (dims.len > 4) ", ..." else "";
-            return std.fmt.allocPrint(gpa, "[{s}{s}]", .{ shown.items, more });
+            if (dims.len > 4) try out.appendSlice(gpa, ", ...");
+            try out.append(gpa, ']');
         },
-        .ref => |rid| return ir.recordIdDisplay(gpa, rid),
+        .ref => |rid| try out.appendSlice(gpa, try ir.recordIdDisplay(gpa, rid)),
     }
 }
 
 /// Rust `{:?}` for strings: quotes + the standard escapes (printable
-/// non-ASCII passes through raw, as `escape_debug` does).
-fn rustDebugString(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
+/// non-ASCII passes through raw, as `escape_debug` does) — appended into
+/// `out`.
+fn debugStrInto(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error!void {
     try out.append(gpa, '"');
     for (s) |c| {
         switch (c) {
@@ -361,7 +413,8 @@ fn rustDebugString(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
             0 => try out.appendSlice(gpa, "\\0"),
             else => {
                 if (c < 0x20 or c == 0x7f) {
-                    try out.appendSlice(gpa, try std.fmt.allocPrint(gpa, "\\u{{{x:0>2}}}", .{c}));
+                    var b: [8]u8 = undefined;
+                    try out.appendSlice(gpa, std.fmt.bufPrint(&b, "\\u{{{x:0>2}}}", .{c}) catch unreachable);
                 } else {
                     try out.append(gpa, c);
                 }
@@ -369,7 +422,6 @@ fn rustDebugString(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
         }
     }
     try out.append(gpa, '"');
-    return out.items;
 }
 
 // ---------------------------------------------------------------------------

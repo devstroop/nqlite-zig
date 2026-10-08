@@ -105,7 +105,7 @@ to be sound). Probe: `scripts/probe_ceiling.py` / `scripts/probe_reopen.py`.
 | BM25 k=10 | 263 ms | **80 ms** | version-keyed index cache + binary-search tf/df |
 | hybrid (RRF) | 496 ms | **326 ms** | both of the above (fusion still needs two full rankings for ranks) |
 | `ORDER BY … LIMIT 10` | 75 ms | **40 ms** | top-k selection |
-| full-scan + response100k | 551 ms | ~550–660 | response formatting (deferred; fits budget) |
+| full-scan + response100k | 551 ms | **formatting 138 → 28 ms in-process** | response formatting fixed (M8++ below); end-to-end scan now engine-bound (external timing noise-bound on this box) |
 
 **kNN @100k = 49 ms beats the reference band (Rust release75–140 ms)** —
 the plan's "exact kNN ≥ Rust" cutover criterion. All changes are
@@ -135,6 +135,29 @@ digests across all 11 experiments, exit 0.**
   test`) proved unreliable at `-Ofast` under machine load (a false
   “hang”); server-side phase timers + the reopen probe were the
   workable method — use those.
+
+## M8++ results (2026-10-08) — response formatting (the M8+ deferral, closed)
+
+**Method** (the only one this box's neighbour load leaves trustworthy):
+in-process micro-bench, `zig build bench-format -Doptimize=ReleaseFast` —
+`formatResult` over100k probe-shaped rows (one string field, scores with
+an exact4dp tie), median of7. **External** process timing of the same
+work swings ±2× run-to-run (an interleaved A/B of old/new binaries
+measured291–647 ms for identical code) — do not cite it.
+
+| metric (100k rows,3.96 MB response line) | before | after |
+| --- | ---: | ---: |
+| `formatResult` in-process median | **138.34 ms** | **27.78 ms (5.0×)** |
+| heap allocations per row | ~6 (id, score, fields, template) | **0** (stack scratch + one buffer) |
+
+Mechanism: one pre-sized response buffer; `score4Into`/`idInto`/
+`fieldsInto`/`shortValueInto`/`debugStrInto` append into it (the math is
+byte-identical — same half-to-even tie rule, same escaping; pub wrappers
+keep `rustFormat4`/`formatFields` for CLI/MCP callers). Byte-proof:
+golden/transcript tests + explicit exp01–exp11 digests + `tcp_probe`.
+Attribution correction: formatting was ~138 ms of the551 ms
+full-scan+response row — the rest is engine projection scan, which is
+now the dominant cost (and box-noisy to measure externally).
 
 ## M8b results (2026-10-08) — lazy history seam
 

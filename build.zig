@@ -89,6 +89,26 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // Response-formatting micro-bench (docs/BENCHMARKING.md): median of R
+    // `formatResult` passes over N synthesized rows, in-process — the only
+    // timing method this box's neighbour load leaves trustworthy.
+    //   zig build bench-format -Doptimize=ReleaseFast
+    const bench = b.addExecutable(.{
+        .name = "bench_format",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_format.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "nqlite_zig", .module = mod }},
+        }),
+    });
+    const bench_cmd = b.addRunArtifact(bench);
+    const bench_step = b.step(
+        "bench-format",
+        "Response-formatting micro-bench (median of7 ×100k rows)",
+    );
+    bench_step.dependOn(&bench_cmd.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
