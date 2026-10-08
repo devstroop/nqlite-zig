@@ -15,7 +15,7 @@ bump) before code; gates below are *exit criteria*, not aspirations.
 | **M6** | Persistence | v4 + WAL + CRC, single-writer flock, reopen; **v3 importer** | persistence suite green + **import answers identical on the E08 100k store ✓** (2026-10-08: `nqlite-experiments/scripts/prove_migrate_100k.py` — v3(rust) == v4(zig), `history = 100001`; surfaced reference checkpoint fixes nqlite #155/#156; Rust serving v4 = nqlite #157) |
 | **M7** | Temporal & graph | AS OF / HISTORY SINCE / PRUNE incl. `HistoryPruned` contracts; MATCH/CLOSURE + AS OF | E07-style rotation-equivalence checks green |
 | **M8** | Performance | **landed**: O(n log n) sorts, candidate-aligned kNN/RRF lookups, BM25 build/score fixes, top-k selection + index cache + slice-by-8 CRC + **lazy history decode** (bound numbers: docs/BENCHMARKING.md); **deferred**: SIMD CRC/kNN, mmap, adjacency index | **E08 gate: 4/4 + full parity 57/57** (was `B-TIMEOUT`); **kNN @100k49 ms beats Rust75–140**; open decode345→204 ms (`decodeCore`), seam unit-pinned |
-| **M9** | Cutover kit | experiments default flip (flagged), knot sidecar ADR (separate), optional WASM spike, release | cutover criteria met (below) |
+| **M9** | Cutover kit | experiments default flip (flagged), knot sidecar ADR (**ADR-002 ✓**), optional WASM spike, release | cutover criteria met (below) |
 
 ## Parallel tracks (worktrees)
 
@@ -29,14 +29,18 @@ main checkouts stay clean and buildable for harness runs.
 
 ## Cutover criteria (coexistence → default)
 
-E01–E10 digests equal · persistence gates green · v3 importer proven on the
-100k store · perf ≥ Rust on open + exact kNN · knot sidecar ADR written
-(even if the decision is "keep Rust for knot") · release tagged.
+E01–E11 digests equal ✓ (57/57) · persistence gates green ✓ · v3 importer
+proven on the 100k store ✓ (`prove_migrate_100k.py`, history=100001) ·
+perf ≥ Rust on open + exact kNN ✓ (kNN 49 ms @100k; open attributed +
+lazy + slice-by-8 CRC) · knot sidecar ADR written ✓ (**ADR-002**: keep
+Rust linkage for knot) · release tagged ⬜.
 
 ## Open decisions (deliberately unresolved)
 
-- Whether the Zig engine ever becomes the default for knot's audit seam
-  (sidecar-over-line-protocol vs FFI) — needs its own ADR after M6.
+- ~~Whether the Zig engine ever becomes the default for knot's audit seam~~
+  — **resolved by ADR-002** (2026-10-08): knot keeps in-process Rust
+  linkage; sidecar-over-wire / FFI only via a future ADR with
+  operations evidence.
 - WASM/edge packaging (nqlite-in-the-worker) — spike only after M8.
 - Zig version bumps (0.18) — deliberate PR moving both pins, with a
   full-gate run first.

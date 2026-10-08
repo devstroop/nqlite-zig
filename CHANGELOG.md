@@ -9,6 +9,15 @@ are met.
 
 ### Added
 
+- **ADR-002 — knot seam decided (cutover criterion ✓)** — knot keeps its
+  **in-process Rust `nql`/`nqlite` linkage** for v1/v1.x (git deps,
+  `Database::open`/`execute`, error-type contract asserted by its own
+  load tests); **zig reaches knot only via the wire** (line protocol /
+  future TCP) — house rule *transports over linkage*. Any switch = a
+  future ADR with operations evidence (sidecar lifecycle/locking or
+  FFI). PLAN open decision resolved; cutover criteria now leave only
+  *release tagged* outstanding.
+
 - **Importer proof — cutover criterion ✓** — the E08 100k store is
   built exactly as `exp08` does (chunked `nql --db` → v3) and migrated
   with `nql-migrate`; answers for7 query kinds (count / kNN / BM25 /
