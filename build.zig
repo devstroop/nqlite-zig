@@ -145,6 +145,20 @@ pub fn build(b: *std.Build) void {
     const bench_c_step = b.step("bench-crc", "CRC micro-bench (slice8 vs pclmul)");
     bench_c_step.dependOn(&bench_c_cmd.step);
 
+    // Ingest micro-bench (sorted-insert scaling): `zig build bench-ingest`
+    const bench_i = b.addExecutable(.{
+        .name = "bench_ingest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_ingest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "nqlite_zig", .module = mod }},
+        }),
+    });
+    const bench_i_cmd = b.addRunArtifact(bench_i);
+    const bench_i_step = b.step("bench-ingest", "Engine ingest scaling (asc/reverse/lex)");
+    bench_i_step.dependOn(&bench_i_cmd.step);
+
     // CRC-32 SIMD path (src/crc32_simd.c — pclmulqdq, runtime-gated by
     // `usePclmul()`): clang encodes it via per-function target attributes
     // (zig's own asm encoder only knows baseline features). x86-only —

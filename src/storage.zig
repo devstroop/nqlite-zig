@@ -237,6 +237,9 @@ pub const StoreFile = struct {
             pos = start + len;
             good = pos;
         }
+        // Queued inserts land before any consumer reads the replayed store
+        // (tests, seed paths — the first query would flush lazily anyway).
+        store.flushDeep() catch return error.Io;
         if (good < data.len) {
             // Truncate the torn tail so a later open doesn't retry it.
             const wf = std.Io.Dir.cwd().openFile(self.io, self.wal, .{ .mode = .read_write }) catch
