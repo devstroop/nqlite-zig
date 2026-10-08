@@ -10,6 +10,16 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ### Changed
 
+- **Response formatting −5× (the M8+ deferral, closed)** —
+  `formatResult` now builds ONE pre-sized buffer with stack scratch
+  (`score4Into`/`idInto`/`fieldsInto`/`shortValueInto` — same math,
+  same escaping, byte-identical) instead of ~6 heap allocations per
+  row: in-process bench (`zig build bench-format`,100k rows /
+  3.96 MB line, median of7) **138.34 →27.78 ms**. New committed
+  micro-bench = the trusted method (external process timing on this
+  box swings ±2×). Pub wrappers keep `rustFormat4`/`formatFields`
+  for CLI/MCP callers.
+
 - **Harness default flip — zig runs all three legs out of the box** —
   `NQL_IMPL` now *opts out* (`=rust`) instead of opting in; unset (or
   `=zig`) = zig for server + CLI + MCP (`nqlite_zig --mcp`).
