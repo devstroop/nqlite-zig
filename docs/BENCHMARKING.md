@@ -81,8 +81,8 @@ All three query regressions were **quadratic** (×5 rows → ×19 time):
 - ~~SIMD exact kNN~~ — **superseded**: top-k selection got kNN to
   49 ms @100k (beats the reference band); literal SIMD on the cosine
   loop remains optional (see M8+ below).
-- **mmap open** (plan M8's ceiling target): deferred — the decode path
-  was the actual open bottleneck (see M8+ attribution below).
+- ~~mmap open~~ — **done (see "mmap results" below)**: decode reads a
+  whole-file read-only mapping directly (read path kept as fallback).
 - ~~BM25 index rebuilt per query~~ — **fixed in M8+** (version-keyed
   cache); see below.
 - **Ingest** uses sorted-insert memmove (O(n²) worst case) — flat
@@ -131,7 +131,7 @@ digests across all 11 experiments, exit 0.**
 - ~~Lazy history decode~~ — **done in M8b below**.
 - ~~CRC32 SIMD~~ — **done: PCLMULQDQ path,10.7× over slice-by-8**
   (see "CRC SIMD results" below).
-- **mmap** instead of read-into-arena.
+- ~~mmap~~ instead of read-into-arena — **done (below)**.
 - The in-test attribution harness (phase timers inside a `zig build
   test`) proved unreliable at `-Ofast` under machine load (a false
   “hang”); server-side phase timers + the reopen probe were the
@@ -177,9 +177,8 @@ NEVER the dominant cost (27–48 ms). The external row is dominated by
 (an interleaved old/new A/B measured291–647 ms for identical code).
 Zig-side full-scan pipeline today: engine ≈27 + formatting ≈28 ≈
 **55 ms @100k rows** (was ≈48 +138 ≈186 ms). Remaining zig-side
-open items by honest size: SIMD CRC on decode (dir+crc ≈100 ms →
-−20…−40 — the earlier “−80…−90” assumed a bigger CRC share), mmap
-(read ≈43–76 ms → −20…−40 +62 MB RSS), ingest O(n²) beyond100k.
+open item by honest size: ingest O(n²) beyond100k (CRC and mmap both
+landed below — CRC −85 ms of reopen, mmap −84 ms of open).
 
 ## CRC SIMD results (2026-10-08) — PCLMULQDQ, the crc32fast-class lever
 
@@ -211,6 +210,37 @@ extensions + scalar helpers for the cold shuffles. Runtime gate =
 `usePclmul()` (cpuid leaf1 ECX bit1), cached once; non-x86 builds never
 reference the symbol (comptime arch gate + build.zig only attaches the C
 on x86).
+
+## mmap results (2026-10-08) — read-into-arena → read-only mapping
+
+**Mechanism**: `StoreFile.loadMain` (and the lazy `takeHistory` re-read)
+now decode straight from a whole-file read-only `posix.mmap`
+(`MAP_PRIVATE`, page-aligned length) instead of `alloc +
+readPositionalAll`. The decode is zero-copy — the store BORROWS the
+bytes — so the mapping lives on `StoreFile` and is unmapped in
+`close()` (an earlier "map, decode, unmap" attempt segfaulted exactly
+there: table names dangle after unmap — the reopen/lazy-history tests
+catched it). Any mmap failure falls back to the read path.
+
+**Measured** (66.4 MB / 100k-row store, interleaved A/B,5 rounds,
+spawn → first response line):
+
+| binary | median | min |
+| --- | ---: | ---: |
+| read-into-arena | 315.5 ms | 311.8 ms |
+| **mmap** | **231.5 ms** | **196.2 ms** |
+
+**−84 ms median (−27%) on open** — larger than the estimated −20…40
+(the whole-file `read()` pass over a page-cache-warm file cost ≈50–70 ms
+here; page faults now happen inline with decode). VmRSS is unchanged by
+design (~144 MB either way — file pages count as resident while
+mapped); the memory win is *reclaimability*: clean file-backed pages
+evict under pressure, where the old ~62.5 MB arena copy was anonymous
+and pinned for the process lifetime.
+
+Byte proof: fixtures + reopen/lazy-history suite + **exp01–exp11 =
+57/57** + `tcp_probe` IDENTICAL (the mapping feeds the same
+`v4.decodeCore`).
 
 ## M8b results (2026-10-08) — lazy history seam
 

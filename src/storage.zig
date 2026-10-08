@@ -54,6 +54,11 @@ pub const StoreFile = struct {
     /// HISTORY section range remembered by `loadMain` for the lazy seam
     /// (reference issue #133): taken once by `takeHistory`.
     hist: ?v4.HistRange = null,
+    /// Whole-file read-only mapping that the ZERO-COPY decode BORROWS from
+    /// (v4 strings point into it — that's the design: `loadMain` never
+    /// dupes bytes). Lives until `close()` unmaps it; `null` = the read
+    /// fallback ran (borrows the process-lifetime arena instead).
+    mapping: ?[]align(std.heap.page_size_min) u8 = null,
 
     /// Open (or create) the store at `path`, taking the single-writer lock.
     /// A missing main file means an empty store (WAL still replays into it).
@@ -111,6 +116,8 @@ pub const StoreFile = struct {
     /// Release the lock explicitly (tests / managed reopen). Process exit
     /// releases it regardless — no stale-lock state exists on unix.
     pub fn close(self: *StoreFile) void {
+        if (self.mapping) |m| std.posix.munmap(m);
+        self.mapping = null;
         if (self.lock_fd) |fd| _ = std.os.linux.close(fd);
         self.lock_fd = null;
     }
@@ -119,6 +126,21 @@ pub const StoreFile = struct {
     /// shorter than a header, mirroring the reference's len < 16 rule).
     /// The HISTORY section is NOT decoded here (issue #133 lazy seam):
     /// `hist` records its range for `takeHistory`/`ensureHistory`.
+    /// Whole-file read-only mapping for decode (page-aligned length, as
+    /// mmap requires). ANY failure → caller falls back to the read path.
+    fn mapMain(f: std.Io.File, size: u64) Error![]align(std.heap.page_size_min) u8 {
+        const len = std.math.cast(usize, size) orelse return error.Io;
+        const aligned = std.mem.alignForward(usize, len, std.heap.pageSize());
+        return std.posix.mmap(
+            null,
+            aligned,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            f.handle,
+            0,
+        ) catch return error.Io;
+    }
+
     pub fn loadMain(self: *StoreFile) Error!?ir.Store {
         const f = std.Io.Dir.cwd().openFile(self.io, self.main, .{}) catch |e| switch (e) {
             error.FileNotFound => return null,
@@ -127,6 +149,17 @@ pub const StoreFile = struct {
         defer f.close(self.io);
         const st = f.stat(self.io) catch return error.Io;
         if (st.size < 24) return null;
+        // mmap read-replacement: decode straight from the mapping (page-cache
+        // in, zero copy — the store BORROWS it, so the mapping is kept on
+        // `self` and unmapped in `close()`). Drops the permanent ~62.5MB
+        // arena copy + full-file memcpy for a100k store. Any mmap failure →
+        // the read path below (borrows the arena instead).
+        if (self.mapping == null) self.mapping = mapMain(f, st.size) catch null;
+        if (self.mapping) |mapping| {
+            const core = v4.decodeCore(mapping[0..st.size], self.gpa) catch return error.Decode;
+            self.hist = core.hist;
+            return core.store;
+        }
         const bytes = try self.gpa.alloc(u8, st.size);
         const n = f.readPositionalAll(self.io, bytes, 0) catch return error.Io;
         const core = v4.decodeCore(bytes[0..n], self.gpa) catch return error.Decode;
@@ -142,6 +175,13 @@ pub const StoreFile = struct {
         self.hist = null;
         const f = std.Io.Dir.cwd().openFile(self.io, self.main, .{}) catch return error.Io;
         defer f.close(self.io);
+        // Same mapping as loadMain (zero-copy borrow); fallback = read path.
+        const st = f.stat(self.io) catch return error.Io;
+        if (r.off > st.size or r.len > st.size - r.off) return error.Decode;
+        if (self.mapping) |mapping| {
+            const slice = mapping[r.off .. r.off + r.len];
+            return v4.decodeHistoryAt(slice, .{ .off = 0, .len = slice.len }, self.gpa) catch return error.Decode;
+        }
         const buf = try self.gpa.alloc(u8, r.len);
         const n = f.readPositionalAll(self.io, buf, r.off) catch return error.Io;
         if (n != r.len) return error.Decode;
