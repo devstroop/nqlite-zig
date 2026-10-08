@@ -8,6 +8,22 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ## [Unreleased]
 
+### Added
+
+- **CLI (`--script` / REPL / `--db`)** — `nqlite_zig` now carries the
+  reference `nql` CLI surface: parse → execute with **no analyzer pass
+  and no cross-line context** (`Session::run` parity), CLI result
+  format (`label (N rows)` + two-space-indented rows, Rust
+  half-to-even scores), `error: …` on stdout, byte-exact banner / HELP
+  / `:flush`→`flushed` / `:store` / `:clear`, and `--db` WAL +
+  checkpoint through the shared `server.walAfterPlan` (extracted from
+  handleLine — one hook, both frontends). **Stdout byte-identical to
+  `nql`** on script and REPL probes (kNN / AS OF / HISTORY SINCE /
+  parse-error / `:store` / trailing blank line); `NQL_IMPL=zig` flips
+  the CLI legs too — exp05/exp08/exp10 green fully-on with
+  `profile: zig` — while `nql-mcp` stays Rust. +6 golden tests
+  (44 total).
+
 ## [0.1.0] - 2026-10-08
 
 First release: the complete nqlite → Zig migration (PLAN M0–M9).

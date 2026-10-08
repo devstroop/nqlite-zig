@@ -17,22 +17,50 @@ pub fn main(init: std.process.Init) !void {
 
     var want_stdio = false;
     var db_path: ?[]const u8 = null;
+    var script_path: ?[]const u8 = null;
+    var bad_arg = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
+        if (i == 0) continue; // argv[0] (the reference's rest-pattern `_`)
         const a = args[i];
-        if (std.mem.eql(u8, a, "--stdio")) want_stdio = true;
-        if (std.mem.eql(u8, a, "--db") or std.mem.eql(u8, a, "-d")) {
+        if (std.mem.eql(u8, a, "--stdio")) {
+            want_stdio = true;
+        } else if (std.mem.eql(u8, a, "--db") or std.mem.eql(u8, a, "-d")) {
             i += 1;
             if (i >= args.len) {
                 std.debug.print("error: --db needs a path\n", .{});
                 std.process.exit(1);
             }
             db_path = args[i];
+        } else if (std.mem.eql(u8, a, "--script") or std.mem.eql(u8, a, "-s")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("{s}\n", .{nqlite_zig.cli.USAGE});
+                std.process.exit(1);
+            }
+            script_path = args[i];
+        } else {
+            bad_arg = true;
         }
     }
+
+    // Shared stdout writer (one response flushed per unit by each mode).
+    var out_buf: [1 << 16]u8 = undefined;
+    var stdout: Io.File.Writer = .init(.stdout(), io, &out_buf);
+    const out = &stdout.interface;
+
     if (!want_stdio) {
-        std.debug.print("nqlite_zig: only --stdio is implemented so far (M4)\n", .{});
-        return error.UnsupportedMode;
+        if (bad_arg) {
+            std.debug.print("{s}\n", .{nqlite_zig.cli.USAGE});
+            std.process.exit(1);
+        }
+        // CLI modes: `--script FILE` or the interactive REPL (`--db` optional)
+        // — byte-contract with nql-cli (src/cli.zig).
+        try nqlite_zig.cli.run(arena, io, out, .{
+            .db_path = db_path,
+            .script_path = script_path,
+        });
+        return;
     }
 
     var server = if (db_path) |p|
@@ -49,9 +77,6 @@ pub fn main(init: std.process.Init) !void {
     var in_buf: [1 << 20]u8 = undefined;
     var stdin_file_reader = Io.File.stdin().reader(io, &in_buf);
     const stdin_reader = &stdin_file_reader.interface;
-    var out_buf: [1 << 16]u8 = undefined;
-    var stdout: Io.File.Writer = .init(.stdout(), io, &out_buf);
-    const out = &stdout.interface;
 
     while (true) {
         const raw = stdin_reader.takeDelimiterInclusive('\n') catch |e| switch (e) {

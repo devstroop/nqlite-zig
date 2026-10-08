@@ -20,6 +20,7 @@ pub const bm25 = @import("bm25.zig");
 // M4: the line-protocol server (nql-server parity).
 pub const storage = @import("storage.zig");
 pub const server = @import("server.zig");
+pub const cli = @import("cli.zig");
 
 // Run every imported file's tests (zig runs tests of files reachable from
 // the root module).
@@ -37,6 +38,7 @@ test {
     _ = @import("bm25.zig");
     _ = @import("results.zig");
     _ = @import("server.zig");
+    _ = @import("cli.zig");
 }
 
 /// This is a documentation comment to explain the `printAnotherMessage` function below.
