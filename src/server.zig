@@ -373,8 +373,70 @@ fn rustDebugString(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
 }
 
 // ---------------------------------------------------------------------------
+// TCP mode (nql-server's default transport — main.zig `--tcp`)
+// ---------------------------------------------------------------------------
+
+/// `PORT` env semantics of nql-server: absent → 7878; present-but-invalid →
+/// null (the reference fails at bind time; we fail loudly before it).
+pub fn parsePort(env: ?[]const u8) ?u16 {
+    const s = env orelse return 7878;
+    return std.fmt.parseInt(u16, s, 10) catch null;
+}
+
+/// Mode A of nql-server (its default): listen on `127.0.0.1:PORT`, one
+/// shared server (database) across every connection, accept served
+/// SEQUENTIALLY — the reference's "deterministic for sequential/single
+/// clients" design. One nql program per line in; one response (result
+/// lines + terminator) flushed per line out; a disconnect just ends that
+/// connection while the listener and store keep going.
+pub fn runTcp(io: std.Io, server: *Server, port: u16) !void {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    std.debug.print("nqlite_zig listening on 127.0.0.1:{d}\n", .{port});
+    while (true) {
+        const stream = listener.accept(io) catch |e| {
+            // Transient accept failure — the listener is still open.
+            std.debug.print("accept error: {s}\n", .{@errorName(e)});
+            continue;
+        };
+        defer stream.close(io);
+        serveTcpConn(io, server, stream) catch {}; // disconnect ends this conn
+    }
+}
+
+/// Serve one connection: same line loop as stdio mode, over the socket.
+fn serveTcpConn(io: std.Io, server: *Server, stream: std.Io.net.Stream) !void {
+    var in_buf: [1 << 20]u8 = undefined;
+    var reader = stream.reader(io, &in_buf);
+    const in = &reader.interface;
+    var out_buf: [1 << 16]u8 = undefined;
+    var writer = stream.writer(io, &out_buf);
+    const w = &writer.interface;
+    while (true) {
+        // EOF or any read error just ends this connection (reference:
+        // "A client disconnect … just ends this connection").
+        const raw = in.takeDelimiterInclusive('\n') catch break;
+        const resp = server.handleLine(raw);
+        w.writeAll(resp) catch break;
+        w.writeAll("\n") catch break;
+        w.flush() catch break;
+    }
+    w.flush() catch {}; // best-effort drain on disconnect
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "parsePort: default7878, strict u16" {
+    try std.testing.expectEqual(@as(?u16, 7878), parsePort(null));
+    try std.testing.expectEqual(@as(?u16, 7878), parsePort("7878"));
+    try std.testing.expectEqual(@as(?u16, 1), parsePort("1"));
+    try std.testing.expect(parsePort("abc") == null);
+    try std.testing.expect(parsePort("70000") == null); // > u16
+    try std.testing.expect(parsePort("-1") == null);
+}
 
 test "server session across lines" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
