@@ -445,7 +445,7 @@ test "cli --db: WAL append + reopen replays (server-free path)" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(
         gpa,
-        "{s}/{s}/cli.nql",
+        "{s}/{s}/cli.ndb",
         .{ std.testing.TmpDir.parent_dir_path, &tmp.sub_path },
     );
     {

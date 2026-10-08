@@ -3,7 +3,7 @@
 //! are the oracle").
 //!
 //! Gates:
-//! 1. every committed `.nql` decodes and re-encodes **byte-identically**;
+//! 1. every committed `.ndb` decodes and re-encodes **byte-identically**;
 //! 2. `manifest.json`'s section tables (offsets/len/crc32) match ours;
 //! 3. `statements.json`: every Statement tag hex-round-trips, and the JSON
 //!    twin maps to the same bytes (semantic pin: variant names, field
@@ -17,7 +17,7 @@ const payload = @import("payload.zig");
 const v4 = @import("v4.zig");
 const crc32mod = @import("crc32.zig");
 
-const FIXTURES = [_][]const u8{ "empty.nql", "plain.nql", "rich.nql", "pruned.nql" };
+const FIXTURES = [_][]const u8{ "empty.ndb", "plain.ndb", "rich.ndb", "pruned.ndb" };
 
 fn readFixture(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
     const io = std.testing.io;
@@ -67,7 +67,7 @@ test "empty fixture layout is pinned (§5.1 arithmetic)" {
     defer arena.deinit();
     const gpa = arena.allocator();
 
-    const bytes = try readFixture(gpa, "empty.nql");
+    const bytes = try readFixture(gpa, "empty.ndb");
     try std.testing.expectEqual(@as(usize, 144), bytes.len);
     const dir = try v4.parseDir(bytes);
     defer std.heap.page_allocator.free(dir);
@@ -619,7 +619,7 @@ test "reader rejects malformed containers" {
     defer arena.deinit();
     const gpa = arena.allocator();
 
-    const base = try readFixture(gpa, "plain.nql");
+    const base = try readFixture(gpa, "plain.ndb");
     const dir = try v4.parseDir(base);
     defer std.heap.page_allocator.free(dir);
     const recs_e: v4.DirEnt = for (dir) |e| {

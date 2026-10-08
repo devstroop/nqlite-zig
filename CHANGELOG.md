@@ -8,6 +8,18 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ## [Unreleased]
 
+### Changed
+
+- **Spec pin → `a1ed5ff` — file-extension split (`.ndb` vs `.nql`)** —
+  the store is now the **neural database file** (`.ndb`; sidecars
+  `.ndb.wal` / `.ndb.lock`), while **`.nql` is reserved for NQL program
+  files** (spec/nql.md "File conventions"; file-format.md "Extensions").
+  Contract files renamed in place: golden fixtures `*.nql` → `*.ndb`
+  (bytes unchanged — content is the oracle), manifest + fixtures README,
+  `fixtures.zig` `FIXTURES`, `check-spec-sync.sh` list; test store
+  paths updated. Content-addressed format → **no runtime change**, old
+  `.nql`-named stores stay valid.
+
 ### Added
 
 - **MCP stdio server (`--mcp`) — the last leg of `NQL_IMPL=zig`** —
