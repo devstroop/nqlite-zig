@@ -1,11 +1,14 @@
 //! CRC-32 micro-bench: slice-by-8 vs PCLMULQDQ on a64 MB buffer, both
 //! in-process (same allocation, back-to-back — no process noise).
+//! Per-iteration samples are kept and reported as p50/p95/p99/max +
+//! MB/s from the mean (issue #28).
 //!
 //! Run: `zig build bench-crc -Doptimize=ReleaseFast`
 const std = @import("std");
 const builtin = @import("builtin");
 const nz = @import("nqlite_zig");
 const crc32mod = nz.crc32;
+const stats = @import("bench_stats.zig");
 
 const SIZE: usize = 64 << 20; // ≈ the store file's section-CRC workload
 const REPS: usize = 7;
@@ -16,15 +19,8 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-fn medianMs(times: []u64) f64 {
-    var t = times;
-    var i: usize = 1;
-    while (i < t.len) : (i += 1) {
-        var j = i;
-        while (j > 0 and t[j] < t[j - 1]) : (j -= 1)
-            std.mem.swap(u64, &t[j], &t[j - 1]);
-    }
-    return @as(f64, @floatFromInt(t[t.len / 2])) / 1_000_000.0;
+fn mbPerSec(mean_ms: f64) f64 {
+    return @as(f64, SIZE) / (mean_ms / 1000.0) / 1_000_000.0;
 }
 
 pub fn main() !void {
@@ -47,13 +43,13 @@ pub fn main() !void {
         acc ^= crc32mod.crc32Slice8(buf);
         t.* = nowNs() - t0;
     }
-    const slice8 = medianMs(&times);
+    const slice8 = stats.Stats.from(&times);
 
     if (comptime (builtin.cpu.arch == .x86 or builtin.cpu.arch == .x86_64)) {
         if (!crc32mod.usePclmul()) {
             std.debug.print(
-                "slice-by-8: {d:.1} ms ({d:.0} MB/s) | simd: unavailable on this CPU\n",
-                .{ slice8, @as(f64, SIZE) / (slice8 / 1000.0) / 1_000_000.0 },
+                "slice-by-8: median {d:.2} ms · p95 {d:.2} · p99 {d:.2} · max {d:.2} · mean {d:.2} · {d:.0} MB/s | simd: unavailable on this CPU\n",
+                .{ slice8.median, slice8.p95, slice8.p99, slice8.max, slice8.mean, mbPerSec(slice8.mean) },
             );
             std.debug.print("checksum={x}\n", .{acc});
             return;
@@ -63,19 +59,31 @@ pub fn main() !void {
             acc ^= crc32mod.crc32(buf); // dispatches to PCLMUL
             t.* = nowNs() - t0;
         }
-        const simd = medianMs(&times);
+        const simd = stats.Stats.from(&times);
         std.debug.print(
-            "crc32 {d} MB × {d} reps: slice-by-8 {d:.2} ms ({d:.0} MB/s) | " ++
-                "pclmulqdq {d:.2} ms ({d:.0} MB/s) | {d:.2}×\n",
+            "crc32 {d} MB × {d} reps: slice-by-8 median {d:.2} ms · p95 {d:.2} · p99 {d:.2} · max {d:.2} · {d:.0} MB/s | " ++
+                "pclmulqdq median {d:.2} ms · p95 {d:.2} · p99 {d:.2} · max {d:.2} · {d:.0} MB/s | {d:.2}×\n",
             .{
-                SIZE >> 20,    REPS,
-                slice8,        @as(f64, SIZE) / (slice8 / 1000.0) / 1_000_000.0,
-                simd,          @as(f64, SIZE) / (simd / 1000.0) / 1_000_000.0,
-                slice8 / simd,
+                SIZE >> 20,
+                REPS,
+                slice8.median,
+                slice8.p95,
+                slice8.p99,
+                slice8.max,
+                mbPerSec(slice8.mean),
+                simd.median,
+                simd.p95,
+                simd.p99,
+                simd.max,
+                mbPerSec(simd.mean),
+                slice8.median / simd.median,
             },
         );
     } else {
-        std.debug.print("slice-by-8: {d:.2} ms (non-x86)\n", .{slice8});
+        std.debug.print(
+            "slice-by-8: median {d:.2} ms · p95 {d:.2} · p99 {d:.2} · max {d:.2} (non-x86)\n",
+            .{ slice8.median, slice8.p95, slice8.p99, slice8.max },
+        );
     }
     std.debug.print("checksum={x}\n", .{acc});
 }

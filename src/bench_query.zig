@@ -8,6 +8,7 @@ const std = @import("std");
 const nz = @import("nqlite_zig");
 const engine = nz.engine;
 const ir = nz.ir;
+const stats = @import("bench_stats.zig");
 
 const N: usize = 100_000;
 const REPS: usize = 7;
@@ -51,16 +52,21 @@ fn benchOne(
         t.* = nowNs() - t0;
         rows = results[0].rows.len;
     }
-    var i: usize = 1;
-    while (i < REPS) : (i += 1) {
-        var j = i;
-        while (j > 0 and times[j] < times[j - 1]) : (j -= 1)
-            std.mem.swap(u64, &times[j], &times[j - 1]);
-    }
-    const med = times[REPS / 2];
+    // Distribution over the kept samples (issue #28); every shape scans
+    // the full N-row table, so rows/s is scan throughput.
+    const st = stats.Stats.from(&times);
     std.debug.print(
-        "{s:<12} median {d:>8.2} ms  (rows={d})\n",
-        .{ label, @as(f64, @floatFromInt(med)) / 1_000_000.0, rows },
+        "{s:<12} median {d:>8.2} ms · p95 {d:>7.2} · p99 {d:>7.2} · max {d:>7.2} · mean {d:>7.2} · {d:>6.2} M rows/s  (rows={d})\n",
+        .{
+            label,
+            st.median,
+            st.p95,
+            st.p99,
+            st.max,
+            st.mean,
+            st.ratePerSec(@floatFromInt(N)) / 1_000_000.0,
+            rows,
+        },
     );
 }
 

@@ -295,3 +295,50 @@ exp05 (reopen + AS OF), exp07 (temporal sweeps) and exp10 (forensics
 AS OF) byte-identical through the seam, plus the two new seam tests
 (temporal-after-reopen; PRUNE-in-WAL-with-main edge — without the
 ensure, compaction would drop file-era declarations).
+
+## Percentile reporting (2026-10-09) — kept samples, full distribution (zig#28)
+
+The in-process benches (the trusted method — external process timing on
+this box is unusable) previously reduced their REPS samples to a median
+at print time. They now keep every per-iteration sample and report the
+distribution through the shared `src/bench_stats.zig`: **p50/p95/p99/max
++ mean + rate** (rows/s, MB/s, K rows/s — from the mean). Percentiles
+use linear interpolation over the sorted samples (index = q·(n−1)) —
+the same rule as `nqlite/scripts/bench-percentiles.py`, so both sides
+describe a run the same way. The primary method is unchanged:
+in-process timing, median of 7, ReleaseFast, same box as §Bindings
+(±10–30% run-to-run shared VM; with n=7 samples p99 interpolates just
+under max — quote the shape, not the decimals).
+
+Reproduce: `zig build bench-format|bench-query|bench-crc|bench-ingest
+-Doptimize=ReleaseFast`.
+
+| bench | shape | p50 (median) | p95 | p99 | max | mean | rate |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| format | formatResult, 100k rows | 15.64 ms | 17.57 | 18.13 | 18.27 | 15.91 ms | 6.28 M rows/s |
+| query | star @100k | 17.54 ms | 21.31 | 21.95 | 22.11 | 18.03 ms | 5.55 M rows/s |
+| query | projection @100k | 19.13 ms | 22.60 | 23.14 | 23.27 | 19.96 ms | 5.01 M rows/s |
+| query | filter @100k (25k match) | 8.07 ms | 8.51 | 8.57 | 8.59 | 8.10 ms | 12.34 M rows/s |
+| crc | slice-by-8, 64 MB | 109.48 ms | 110.79 | 110.90 | 110.93 | — | 693 MB/s |
+| crc | pclmulqdq, 64 MB | 12.36 ms | 13.53 | 13.58 | 13.59 | — | 5 347 MB/s (8.85×) |
+
+| ingest (insert path, fresh store per rep) | p50 | p95 | p99 | max | mean | rate | flush p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| asc 20k | 35.19 ms | 38.03 | 38.12 | 38.15 | 34.92 ms | 572.7 K rows/s | 60.74 ms |
+| reverse 20k | 27.00 ms | 28.57 | 28.77 | 28.82 | 27.06 ms | 739.0 K rows/s | 37.18 ms |
+| lex 20k | 21.64 ms | 23.19 | 23.37 | 23.41 | 21.86 ms | 914.8 K rows/s | 33.51 ms |
+| asc 50k | 67.83 ms | 69.75 | 69.83 | 69.85 | 67.76 ms | 737.9 K rows/s | 83.17 ms |
+| reverse 50k | 68.84 ms | 80.24 | 83.79 | 84.68 | 70.37 ms | 710.5 K rows/s | 77.38 ms |
+| lex 50k | 67.04 ms | 68.11 | 68.20 | 68.22 | 66.73 ms | 749.3 K rows/s | 97.01 ms |
+| asc 100k | 91.91 ms | 111.60 | 111.68 | 111.71 | 99.39 ms | 1 006 K rows/s | 165.79 ms |
+| reverse 100k | 92.02 ms | 98.44 | 98.95 | 99.08 | 93.55 ms | 1 069 K rows/s | 154.22 ms |
+| lex 100k | 90.69 ms | 93.39 | 93.61 | 93.66 | 91.19 ms | 1 097 K rows/s | 194.83 ms |
+
+Notes: bench-ingest now runs REPS fresh-store iterations per (size,
+order) — previously a single sample per row of the table; the deferred
+insert-queue design still holds flat **~0.9–1.8 µs/row for every id
+order** (the structural claim, now with tails: reverse@100k p99 is
+98.95 ms — still flat, no quadratic anywhere; asc@100k's p95−p50 ~20 ms
+spread is neighbor-load, not order-dependent). The query filter shape's
+rate counts the 100k rows scanned; `(rows=…)` continues to print the
+matched count.
