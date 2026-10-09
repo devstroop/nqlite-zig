@@ -246,11 +246,24 @@ pub fn formatResult(gpa: std.mem.Allocator, res: engine.QueryResult) ![]const u8
     var num_buf: [24]u8 = undefined;
     const suffix = std.fmt.bufPrint(&num_buf, "({d} rows): ", .{res.rows.len}) catch unreachable;
     try out.appendSlice(gpa, suffix);
-    for (res.rows, 0..) |row, i| {
-        if (i > 0) try out.appendSlice(gpa, "; ");
-        try formatRowInto(&out, gpa, row);
-    }
+    try appendRowsInto(&out, gpa, res.rows);
     return out.toOwnedSlice(gpa);
+}
+
+/// The hot row loop as a standalone fn with primitive args — no `self`,
+/// no method context (TIGER_STYLE §Performance, issue #27): the compiler
+/// caches `out`/`gpa`/`rows` in registers without proving aliasing, and
+/// the separator rule reads on its own. Byte-identical output (the
+/// golden/transcript tests pin it).
+fn appendRowsInto(
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    rows: []const engine.Row,
+) !void {
+    for (rows, 0..) |row, i| {
+        if (i > 0) try out.appendSlice(gpa, "; ");
+        try formatRowInto(out, gpa, row);
+    }
 }
 
 /// `MATCH <start> ->:name <-:other` — arrows as the reference prints them.

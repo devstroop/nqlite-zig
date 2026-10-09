@@ -20,8 +20,10 @@ calendar (charter: [docs/ADR/001-charter-and-toolchain.md](docs/ADR/001-charter-
 
 ## Toolchain
 
-- **Zig 0.17.0** — pinned twice: [.zigversion](.zigversion) (checked by CI
-  against `zig version`) and `minimum_zig_version` in `build.zig.zon`.
+- **Zig 0.17.0** — pinned three times: [.zigversion](.zigversion) (checked by CI
+  against `zig version`), `minimum_zig_version` in `build.zig.zon`, and a
+  comptime version gate in `build.zig` that fails compilation with a clear
+  message on any mismatch (issue #27, TIGER_STYLE reference).
   Upgrades are deliberate PRs that move both pins.
 
 ## Build & test

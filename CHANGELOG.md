@@ -10,6 +10,25 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ### Added
 
+- **TigerStyle adoption pass (#27)** — three TB-inspired hardenings:
+  (1) **comptime version gate** in `build.zig` — exact Zig 0.17.0 pin
+  with a clear `@compileError` (README's "pinned twice" → three times);
+  (2) **hot-loop extraction**: `formatResult`'s row loop is now a
+  standalone fn with primitive args, no method context
+  (`appendRowsInto`) — before/after on `bench-format` (median-of-7,
+  ReleaseFast): before median 15.64 ms, after 14.85–17.57 ms across
+  runs — **Δ within this box's ±10–30% noise, i.e. codegen-neutral as
+  intended**; the win is structural (register-cached primitive args,
+  loop readable on its own), same honest-0% ledger as #144's norm-cache;
+  (3) **assertion pass** on `v4.zig` + `storage.zig` (the repo had
+  zero `std.debug.assert`s outside the bench helper): comptime
+  container-geometry asserts (magic/header/directory-entry sizes,
+  version tag, alignments), pair asserts at encode (layout monotonic +
+  aligned, header+dir = `table_end`) and decode (directory count ↔
+  records built), WAL frame-layout assert before write, replay-prefix
+  bound, read-length pair, checkpoint tmp-path pair. Golden/transcript
+  suites pin byte-identical output through the refactor.
+
 - **Bench percentiles + kept per-iteration samples (#28)** — the four
   in-process benches (`bench-format`/`bench-query`/`bench-crc`/
   `bench-ingest`) no longer reduce their REPS samples to a median at

@@ -42,6 +42,19 @@ fn alignUp(x: u64, a: u64) u64 {
     return if (rem == 0) x else x + (a - rem);
 }
 
+// ---- TIGER_STYLE §Safety (issue #27): comptime relationship asserts ----
+// The container's fixed geometry, pinned at compile time: a refactor that
+// moves a header/entry size fails to build instead of mis-parsing files.
+comptime {
+    std.debug.assert(MAGIC.len == 8);
+    std.debug.assert(HEADER_LEN == 24); // magic8 + version4 + flags4 + count4 + reserved4
+    std.debug.assert(DIR_ENTRY_LEN == 32); // tag4 + reserved4 + off8 + len8 + crc4 + pad4
+    std.debug.assert(V4 == 4);
+    std.debug.assert(alignment(@backingInt(Tag.tables)) == 8);
+    std.debug.assert(alignment(@backingInt(Tag.strings)) == 4096);
+    std.debug.assert(alignment(@backingInt(Tag.history)) == 4096);
+}
+
 pub const Error = error{
     // §5.1 container rules
     Truncated,
@@ -267,6 +280,11 @@ pub fn encode(store: ir.Store, gpa: std.mem.Allocator) Error![]u8 {
     var cursor: u64 = table_end;
     for (sections.items) |*s| {
         const off = alignUp(cursor, alignment(s.tag));
+        // Pair (write side): the layout decision is pinned as it is made —
+        // alignUp never moves backwards and always lands on the tag's
+        // alignment (TIGER_STYLE, issue #27).
+        std.debug.assert(off >= cursor);
+        std.debug.assert(off % alignment(s.tag) == 0);
         s.off = off;
         cursor = off + s.len;
     }
@@ -291,6 +309,9 @@ pub fn encode(store: ir.Store, gpa: std.mem.Allocator) Error![]u8 {
     try appendU32le(&out, gpa, 0); // reserved = 0
     const dir_start = out.items.len;
     try out.appendNTimes(gpa, 0, DIR_ENTRY_LEN * sections.items.len);
+    // Pair (write side): the bytes just laid down match the §5.1 geometry.
+    std.debug.assert(dir_start == HEADER_LEN);
+    std.debug.assert(out.items.len == table_end);
 
     var staged: std.ArrayList(u8) = .empty;
     defer staged.deinit(gpa);
@@ -485,6 +506,9 @@ pub fn decodeCore(bytes: []const u8, gpa: std.mem.Allocator) Error!Core {
     const n_rec = std.math.cast(usize, try rp.u64le()) orelse return error.UlebOverflow;
     const dir_end: usize = 8 + 48 * n_rec;
     if (rec_bytes.len < dir_end) return error.Truncated;
+    // Postcondition of the bounds check the record loop below relies on
+    // (pair: asserted at the read, pinned again against n_rec at the end).
+    std.debug.assert(rec_bytes.len >= dir_end);
 
     var records: std.ArrayList(ir.Record) = .empty;
     errdefer records.deinit(gpa);
@@ -558,6 +582,9 @@ pub fn decodeCore(bytes: []const u8, gpa: std.mem.Allocator) Error!Core {
             .created_at = created_at,
         });
     }
+    // Pair (read side): every directory entry produced exactly one record —
+    // the count read from the section header ↔ the rows actually built.
+    std.debug.assert(records.items.len == n_rec);
     const records_out = try records.toOwnedSlice(gpa);
     errdefer gpa.free(records_out);
 
@@ -644,6 +671,9 @@ pub fn decodeCore(bytes: []const u8, gpa: std.mem.Allocator) Error!Core {
 /// holds the single-writer lock, so no re-verification is needed.
 pub fn decodeHistoryAt(bytes: []const u8, r: HistRange, gpa: std.mem.Allocator) Error![]const ir.HistoryEntry {
     if (r.off + r.len > bytes.len) return error.Truncated;
+    // Postcondition of the range check above — pinned at the use site
+    // (pair with the write-side layout asserts in `encode`).
+    std.debug.assert(r.off + r.len <= bytes.len);
     const h_bytes = bytes[r.off .. r.off + r.len];
     var hr = payload.Reader.init(h_bytes);
     const history = try hr.historyVecInto(gpa);

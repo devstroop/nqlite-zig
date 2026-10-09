@@ -1,4 +1,28 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Exact toolchain gate (issue #27 — TIGER_STYLE reference, TB's own
+/// `build.zig` comptime pin): this build compiles only under this precise
+/// Zig version. A mismatch fails fast with a clear message instead of
+/// drifting on std/API behavior; bump deliberately, never silently.
+const required_zig_version = std.SemanticVersion{
+    .major = 0,
+    .minor = 17,
+    .patch = 0,
+};
+
+comptime {
+    const equal =
+        required_zig_version.major == builtin.zig_version.major and
+        required_zig_version.minor == builtin.zig_version.minor and
+        required_zig_version.patch == builtin.zig_version.patch;
+    if (!equal) {
+        @compileError(std.fmt.comptimePrint(
+            "unsupported zig version: nqlite-zig requires exactly {f}, found {f} — install the pinned toolchain or update `required_zig_version` in build.zig as a deliberate, reviewed change (issue #27)",
+            .{ required_zig_version, builtin.zig_version },
+        ));
+    }
+}
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
