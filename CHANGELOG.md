@@ -8,6 +8,23 @@ release, cut once the cutover criteria in [PLAN.md](PLAN.md) were met**
 
 ## [Unreleased]
 
+### Added
+
+- **Bench percentiles + kept per-iteration samples (#28)** — the four
+  in-process benches (`bench-format`/`bench-query`/`bench-crc`/
+  `bench-ingest`) no longer reduce their REPS samples to a median at
+  print time: a shared `src/bench_stats.zig` reports **p50/p95/p99/max
+  + mean + rate** from the kept samples (linear-interpolation
+  percentiles — the same rule as the Rust side's
+  `bench-percentiles.py`; median keeps its exact old definition so
+  published medians stay comparable). `bench-ingest` now measures
+  REPS fresh-store iterations per (size, order) instead of one sample
+  per row. Tables recorded in `docs/BENCHMARKING.md` (ReleaseFast,
+  bound to box/profile/date): e.g. format p99 18.13 ms, query-star p99
+  21.95 ms @100k, pclmul p99 13.58 ms, ingest reverse@100k p99
+  98.95 ms — flat, no quadratic. Method unchanged: in-process, median
+  of 7 (external process timing on this box is unusable).
+
 ### Changed
 
 - **Response formatting −5× (the M8+ deferral, closed)** —

@@ -1,7 +1,8 @@
 //! Response-formatting micro-bench: `formatResult` over N synthesized
 //! rows, median of R reps — in-process (external process timing on this
 //! box swings ±2× under the neighbour workload; BENCHMARKING.md cites
-//! this method).
+//! this method). Per-iteration samples are kept and reported as
+//! p50/p95/p99/max + rate (issue #28) — same method, fuller output.
 //!
 //! Run: `zig build bench-format -Doptimize=ReleaseFast`
 const std = @import("std");
@@ -9,6 +10,7 @@ const nz = @import("nqlite_zig");
 const engine = nz.engine;
 const ir = nz.ir;
 const server = nz.server;
+const stats = @import("bench_stats.zig");
 
 const N: usize = 100_000;
 const REPS: usize = 7;
@@ -56,16 +58,20 @@ pub fn main() !void {
         t.* = nowNs() - t0;
         line_len = line.len;
     }
-    // Insertion sort (REPS items — no std.sort API risk).
-    var i: usize = 1;
-    while (i < REPS) : (i += 1) {
-        var j = i;
-        while (j > 0 and times[j] < times[j - 1]) : (j -= 1)
-            std.mem.swap(u64, &times[j], &times[j - 1]);
-    }
-    const med = times[REPS / 2];
+    // Sort + distribution over the kept samples (issue #28).
+    const st = stats.Stats.from(&times);
     std.debug.print(
-        "formatResult {d} rows × {d} reps: median {d:.2} ms (line = {d} bytes)\n",
-        .{ N, REPS, @as(f64, @floatFromInt(med)) / 1_000_000.0, line_len },
+        "formatResult {d} rows × {d} reps: median {d:.2} ms · p95 {d:.2} ms · p99 {d:.2} ms · max {d:.2} ms · mean {d:.2} ms · {d:.2} M rows/s (line = {d} bytes)\n",
+        .{
+            N,
+            REPS,
+            st.median,
+            st.p95,
+            st.p99,
+            st.max,
+            st.mean,
+            st.ratePerSec(@floatFromInt(N)) / 1_000_000.0,
+            line_len,
+        },
     );
 }
