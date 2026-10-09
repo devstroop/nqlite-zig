@@ -208,6 +208,8 @@ pub const StoreFile = struct {
         if (st.size == 0) return;
         const buf = try self.gpa.alloc(u8, st.size);
         const n = f.readPositionalAll(self.io, buf, 0) catch return error.Io;
+        // Pair (read side): never more bytes than the buffer that awaited them.
+        std.debug.assert(n <= buf.len);
         const data = buf[0..n];
 
         var pos: usize = 0;
@@ -236,6 +238,9 @@ pub const StoreFile = struct {
             _ = engine.executeInContext(store, stmt, &current_memory) catch break;
             pos = start + len;
             good = pos;
+            // Explicit loop bound (TIGER_STYLE, issue #27): the accepted
+            // prefix never runs past the bytes it was read from.
+            std.debug.assert(good <= data.len);
         }
         // Queued inserts land before any consumer reads the replayed store
         // (tests, seed paths — the first query would flush lazily anyway).
@@ -269,6 +274,9 @@ pub const StoreFile = struct {
         try frame.appendSlice(self.gpa, &le32(crc));
         try frame.appendSlice(self.gpa, &le32(@intCast(body.len)));
         try frame.appendSlice(self.gpa, body);
+        // Pair (write side): the frame matches the spec §2 layout before it
+        // reaches the file — crc32(4) + len(4) + payload.
+        std.debug.assert(frame.items.len == 8 + body.len);
 
         const wf = if (std.Io.Dir.cwd().openFile(self.io, self.wal, .{ .mode = .read_write })) |f|
             f
@@ -293,6 +301,10 @@ pub const StoreFile = struct {
     /// see TODO below).
     pub fn checkpoint(self: *StoreFile, bytes: []const u8) Error!void {
         const tmp = try std.fmt.allocPrint(self.gpa, "{s}.tmp", .{self.main});
+        // Pair (write side): the staging path is the main path + ".tmp"
+        // (§4 atomic replace — a wrong template would rename over nothing).
+        std.debug.assert(std.mem.endsWith(u8, tmp, ".tmp"));
+        std.debug.assert(tmp.len == self.main.len + 4);
         {
             const f = std.Io.Dir.cwd()
                 .createFile(self.io, tmp, .{ .read = true, .truncate = true }) catch
